@@ -895,9 +895,9 @@ ${C_BOLD}Usage:${C_RESET}
   tm protect <name>     Toggle protection status
   tm summarize <name>   Generate AI summary for a session
   tm summarize-all      Generate AI summaries for all sessions
-  tm save               Snapshot all sessions (for restore after reboot)
-  tm restore [--claude] Restore sessions from snapshot (--claude: auto-launch Claude Code)
-  tm snapshots          Show latest snapshot contents
+  tm save               Snapshot all sessions, windows, panes & layouts
+  tm restore [--claude] Restore full session tree (--claude: relaunch Claude per pane)
+  tm snapshots          Show latest snapshot contents (sessions → windows → panes)
   tm help               Show this help
 
 ${C_BOLD}Interactive menu shortcuts:${C_RESET}
@@ -1242,21 +1242,29 @@ _has_conversation() {
   [[ -d "$conv_dir" ]] && compgen -G "${conv_dir}/*.jsonl" >/dev/null 2>&1
 }
 
+# Detect whether a specific pane is running Claude Code (by pane_pid)
+_pane_has_claude() {
+  local pane_pid="$1"
+  local children c
+  children=$(pgrep -P "$pane_pid" 2>/dev/null) || return 1
+  [[ -z "$children" ]] && return 1
+  c=$(ps -o command= -p $children 2>/dev/null | grep -c "claude" || true)
+  [[ "$c" -gt 0 ]]
+}
+
 # Detect whether any pane in a session is running Claude Code
 _session_has_claude() {
   local session="$1"
-  local pane_pid children count=0 c
+  local pane_pid
   for pane_pid in $(tmux list-panes -t "$session" -s -F '#{pane_pid}' 2>/dev/null); do
-    children=$(pgrep -P "$pane_pid" 2>/dev/null) || true
-    if [[ -n "$children" ]]; then
-      c=$(ps -o command= -p $children 2>/dev/null | grep -c "claude" || true)
-      count=$((count + c))
+    if _pane_has_claude "$pane_pid"; then
+      return 0
     fi
   done
-  [[ "$count" -gt 0 ]]
+  return 1
 }
 
-# Save snapshot of all tmux sessions
+# Save snapshot of all tmux sessions, windows, panes & layouts
 _cmd_save() {
   if ! _has_tmux_server; then
     echo -e "${C_RED}✗ No tmux server running${C_RESET}" >&2
@@ -1274,49 +1282,101 @@ _cmd_save() {
     cp "$SNAPSHOT_FILE" "${SNAPSHOT_FILE}.bak"
   fi
 
-  local sessions_json="[]"
-  local saved=0
-  local session path has_claude claude_mode
+  # Build TSV stream: one line per pane.
+  # Fields: SESSION \t WIN_IDX \t WIN_NAME \t WIN_ACTIVE \t WIN_LAYOUT \t
+  #         PANE_IDX \t PANE_ACTIVE \t PANE_PATH \t HAS_CLAUDE \t CLAUDE_MODE
+  local tsv=""
+  local session win_line win_idx win_name win_active win_layout
+  local pane_line pane_idx pane_active pane_path pane_pid has_claude claude_mode
 
   while IFS= read -r session; do
-    path=$(tmux display-message -t "$session" -p '#{pane_current_path}' 2>/dev/null || echo "")
-    [[ -z "$path" ]] && continue
-
-    has_claude=false
-    if _session_has_claude "$session"; then
-      has_claude=true
-    fi
-
-    claude_mode="fresh"
-    if _has_conversation "$path"; then
-      claude_mode="continue"
-    fi
-
-    sessions_json=$(python3 -c "
-import json, sys
-arr = json.loads(sys.argv[1])
-arr.append({
-    'name': sys.argv[2],
-    'path': sys.argv[3],
-    'has_claude': sys.argv[4] == 'true',
-    'claude_mode': sys.argv[5]
-})
-print(json.dumps(arr))
-" "$sessions_json" "$session" "$path" "$has_claude" "$claude_mode")
-
-    saved=$((saved + 1))
+    [[ -z "$session" ]] && continue
+    while IFS=$'\t' read -r win_idx win_name win_active win_layout; do
+      [[ -z "$win_idx" ]] && continue
+      while IFS=$'\t' read -r pane_idx pane_active pane_path pane_pid; do
+        [[ -z "$pane_idx" || -z "$pane_path" ]] && continue
+        if _pane_has_claude "$pane_pid"; then
+          has_claude=true
+        else
+          has_claude=false
+        fi
+        if _has_conversation "$pane_path"; then
+          claude_mode="continue"
+        else
+          claude_mode="fresh"
+        fi
+        tsv+="${session}"$'\t'"${win_idx}"$'\t'"${win_name}"$'\t'"${win_active}"$'\t'"${win_layout}"$'\t'"${pane_idx}"$'\t'"${pane_active}"$'\t'"${pane_path}"$'\t'"${has_claude}"$'\t'"${claude_mode}"$'\n'
+      done < <(tmux list-panes -t "${session}:${win_idx}" -F '#{pane_index}	#{?pane_active,1,0}	#{pane_current_path}	#{pane_pid}' 2>/dev/null)
+    done < <(tmux list-windows -t "$session" -F '#{window_index}	#{window_name}	#{?window_active,1,0}	#{window_layout}' 2>/dev/null)
   done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
 
-  python3 -c "
+  # Group TSV into nested JSON via Python
+  local py_save
+  py_save=$(cat <<'PY'
 import json, sys
-data = {'timestamp': sys.argv[1], 'sessions': json.loads(sys.argv[2])}
-print(json.dumps(data, indent=2))
-" "$timestamp" "$sessions_json" > "$SNAPSHOT_FILE"
 
-  echo -e "${C_GREEN}✓${C_RESET} Saved ${C_BOLD}${saved}${C_RESET} sessions → ${C_DIM}${SNAPSHOT_FILE}${C_RESET}"
+timestamp = sys.argv[1]
+out_path = sys.argv[2]
+
+sessions = {}  # name -> {"name", "active_window", "windows": {idx: {...}}}
+for line in sys.stdin.read().splitlines():
+    if not line:
+        continue
+    parts = line.split('\t')
+    if len(parts) != 10:
+        continue
+    sname, w_idx, w_name, w_active, w_layout, p_idx, p_active, p_path, has_cl, cl_mode = parts
+    w_idx_i = int(w_idx)
+    p_idx_i = int(p_idx)
+    s = sessions.setdefault(sname, {"name": sname, "active_window": 0, "windows": {}})
+    if w_active == "1":
+        s["active_window"] = w_idx_i
+    w = s["windows"].setdefault(w_idx_i, {
+        "index": w_idx_i, "name": w_name, "layout": w_layout,
+        "active_pane": 0, "panes": {},
+    })
+    if p_active == "1":
+        w["active_pane"] = p_idx_i
+    w["panes"][p_idx_i] = {
+        "index": p_idx_i,
+        "path": p_path,
+        "has_claude": has_cl == "true",
+        "claude_mode": cl_mode,
+    }
+
+out_sessions = []
+for sname in sorted(sessions):
+    s = sessions[sname]
+    windows = []
+    for w_idx in sorted(s["windows"]):
+        w = s["windows"][w_idx]
+        w["panes"] = [w["panes"][k] for k in sorted(w["panes"])]
+        windows.append(w)
+    out_sessions.append({
+        "name": s["name"],
+        "active_window": s["active_window"],
+        "windows": windows,
+    })
+
+data = {"version": 2, "timestamp": timestamp, "sessions": out_sessions}
+with open(out_path, "w") as f:
+    json.dump(data, f, indent=2)
+
+n_sess = len(out_sessions)
+n_win  = sum(len(s["windows"]) for s in out_sessions)
+n_pane = sum(len(w["panes"]) for s in out_sessions for w in s["windows"])
+print(f"{n_sess}\t{n_win}\t{n_pane}")
+PY
+)
+
+  local summary n_sess n_win n_pane
+  summary=$(printf '%s' "$tsv" | python3 -c "$py_save" "$timestamp" "$SNAPSHOT_FILE")
+  IFS=$'\t' read -r n_sess n_win n_pane <<<"$summary"
+
+  echo -e "${C_GREEN}✓${C_RESET} Saved ${C_BOLD}${n_sess:-0}${C_RESET} sessions · ${C_BOLD}${n_win:-0}${C_RESET} windows · ${C_BOLD}${n_pane:-0}${C_RESET} panes → ${C_DIM}${SNAPSHOT_FILE}${C_RESET}"
 }
 
-# Restore sessions from snapshot
+# Restore sessions from snapshot (full session/window/pane tree)
 _cmd_restore() {
   local start_claude=false
   if [[ "${1:-}" == "--claude" ]]; then
@@ -1331,58 +1391,152 @@ _cmd_restore() {
 
   _check_cmd python3
 
-  local timestamp
-  timestamp=$(python3 -c "import json; d=json.load(open('$SNAPSHOT_FILE')); print(d['timestamp'])")
-  echo -e "${C_BOLD}Restoring from snapshot:${C_RESET} ${timestamp}"
-
   local existing=""
   if _has_tmux_server; then
     existing=$(tmux list-sessions -F '#{session_name}' 2>/dev/null)
   fi
 
-  local restored=0 skipped=0 claude_started=0
-  local name path has_claude claude_mode
+  # Python handles the orchestration: validates version, drives tmux commands,
+  # prints colored status lines to stdout, returns a summary on the last line.
+  local py_restore
+  py_restore=$(cat <<'PY'
+import json, os, subprocess, sys
 
-  while IFS='|' read -r name path has_claude claude_mode; do
-    if echo "$existing" | grep -qx "$name"; then
-      echo -e "  ${C_DIM}SKIP${C_RESET}  ${name} (already exists)"
-      skipped=$((skipped + 1))
-      continue
-    fi
+SNAPSHOT  = sys.argv[1]
+START_CL  = sys.argv[2] == "true"
+EXISTING  = set(filter(None, sys.argv[3].splitlines())) if len(sys.argv) > 3 else set()
 
-    if [[ ! -d "$path" ]]; then
-      echo -e "  ${C_YELLOW}SKIP${C_RESET}  ${name} (path not found: ${path})"
-      skipped=$((skipped + 1))
-      continue
-    fi
+# ANSI color codes (must match bash C_* constants)
+G  = "\033[32m"; R  = "\033[31m"; Y = "\033[33m"
+B  = "\033[1m";  D  = "\033[2m"; X = "\033[0m"
 
-    tmux new-session -d -s "$name" -c "$path" 2>/dev/null
-    echo -e "  ${C_GREEN}OK${C_RESET}    ${name} → ${path/#$HOME/~}"
-    restored=$((restored + 1))
+try:
+    data = json.load(open(SNAPSHOT))
+except Exception as e:
+    print(f"{R}✗ Failed to read snapshot: {e}{X}", file=sys.stderr)
+    sys.exit(1)
 
-    if [[ "$start_claude" == true && "$has_claude" == "true" ]]; then
-      if [[ "$claude_mode" == "continue" ]]; then
-        tmux send-keys -t "$name" 'claude --continue --dangerously-skip-permissions' Enter
-      else
-        tmux send-keys -t "$name" 'claude --dangerously-skip-permissions' Enter
-      fi
-      claude_started=$((claude_started + 1))
-    fi
-  done < <(python3 -c "
-import json
-d = json.load(open('$SNAPSHOT_FILE'))
-for s in d['sessions']:
-    print(f\"{s['name']}|{s['path']}|{str(s['has_claude']).lower()}|{s['claude_mode']}\")
-")
+version = data.get("version", 1)
+if version < 2:
+    print(f"{R}✗ Old snapshot format (version {version}) detected.{X}", file=sys.stderr)
+    print(f"{D}  This version of tm requires snapshot v2. Run 'tm save' again to upgrade.{X}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"{B}Restoring from snapshot:{X} {data.get('timestamp','?')}")
+
+def tmux(*args, check=True):
+    r = subprocess.run(["tmux", *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        return None, r.stderr.strip()
+    return r.stdout.strip(), None
+
+def safe_path(p):
+    return p if (p and os.path.isdir(p)) else os.environ.get("HOME", "/")
+
+n_sess = n_win = n_pane = 0
+n_skip = 0
+n_claude = 0
+
+for s in data.get("sessions", []):
+    sname = s["name"]
+    if sname in EXISTING:
+        print(f"  {D}SKIP{X}  {sname} (already exists)")
+        n_skip += 1
+        continue
+
+    windows = s.get("windows", [])
+    if not windows or not windows[0].get("panes"):
+        print(f"  {Y}SKIP{X}  {sname} (no panes in snapshot)")
+        n_skip += 1
+        continue
+
+    # Determine base path (first window's first pane) and warn if missing
+    w0 = windows[0]
+    p0 = w0["panes"][0]
+    base_path = p0["path"]
+    if not os.path.isdir(base_path):
+        print(f"  {Y}WARN{X}  {sname} pane 0 path missing ({base_path}), falling back to $HOME")
+        base_path = os.environ.get("HOME", "/")
+
+    # Stage 1: create session with first window
+    _, err = tmux("new-session", "-d", "-s", sname, "-c", base_path, "-n", w0.get("name", ""))
+    if err is not None:
+        print(f"  {R}FAIL{X}  {sname} (new-session: {err})")
+        n_skip += 1
+        continue
+
+    pretty = base_path.replace(os.environ.get("HOME", ""), "~", 1) if os.environ.get("HOME") else base_path
+    print(f"  {G}OK{X}    {sname} → {pretty}")
+    n_sess += 1
+    n_win += 1
+    n_pane += 1
+
+    # Stage 2a: window 0 — split remaining panes & apply layout
+    for p in w0["panes"][1:]:
+        tmux("split-window", "-t", f"{sname}:{w0['index']}", "-c", safe_path(p["path"]))
+        n_pane += 1
+    if w0.get("layout"):
+        tmux("select-layout", "-t", f"{sname}:{w0['index']}", w0["layout"])
+    tmux("select-pane", "-t", f"{sname}:{w0['index']}.{w0.get('active_pane', 0)}")
+
+    # Stage 1b + 2b: remaining windows
+    for w in windows[1:]:
+        wp0 = w["panes"][0] if w.get("panes") else None
+        if not wp0:
+            continue
+        wname = w.get("name", "")
+        tmux("new-window", "-t", f"{sname}:{w['index']}", "-c", safe_path(wp0["path"]), "-n", wname)
+        n_win += 1
+        n_pane += 1
+        for p in w["panes"][1:]:
+            tmux("split-window", "-t", f"{sname}:{w['index']}", "-c", safe_path(p["path"]))
+            n_pane += 1
+        if w.get("layout"):
+            tmux("select-layout", "-t", f"{sname}:{w['index']}", w["layout"])
+        tmux("select-pane", "-t", f"{sname}:{w['index']}.{w.get('active_pane', 0)}")
+
+    # Stage 3: launch Claude per-pane if requested
+    if START_CL:
+        for w in windows:
+            for p in w.get("panes", []):
+                if not p.get("has_claude"):
+                    continue
+                cmd = "claude --continue --dangerously-skip-permissions" if p.get("claude_mode") == "continue" \
+                      else "claude --dangerously-skip-permissions"
+                target = f"{sname}:{w['index']}.{p['index']}"
+                tmux("send-keys", "-t", target, cmd, "Enter")
+                n_claude += 1
+
+    # Finally: set active window
+    tmux("select-window", "-t", f"{sname}:{s.get('active_window', 0)}")
+
+# Summary line (parsed by bash caller)
+print(f"__SUMMARY__\t{n_sess}\t{n_win}\t{n_pane}\t{n_skip}\t{n_claude}")
+PY
+)
+
+  local out summary n_sess n_win n_pane n_skip n_claude
+  out=$(python3 -c "$py_restore" "$SNAPSHOT_FILE" "$start_claude" "$existing")
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "$out"
+    exit $rc
+  fi
+
+  # Print everything except the summary line, then parse summary
+  summary=$(printf '%s\n' "$out" | grep '^__SUMMARY__' | head -n1)
+  printf '%s\n' "$out" | grep -v '^__SUMMARY__'
+
+  IFS=$'\t' read -r _ n_sess n_win n_pane n_skip n_claude <<<"$summary"
 
   echo ""
-  echo -e "${C_BOLD}Done:${C_RESET} ${restored} restored, ${skipped} skipped"
-  if [[ "$claude_started" -gt 0 ]]; then
-    echo -e "${C_BOLD}Claude Code started in ${claude_started} sessions${C_RESET}"
+  echo -e "${C_BOLD}Done:${C_RESET} ${n_sess:-0} sessions · ${n_win:-0} windows · ${n_pane:-0} panes restored, ${n_skip:-0} skipped"
+  if [[ "${n_claude:-0}" -gt 0 ]]; then
+    echo -e "${C_BOLD}Claude Code started in ${n_claude} panes${C_RESET}"
   fi
 }
 
-# List latest snapshot contents
+# List latest snapshot contents (sessions → windows → panes)
 _cmd_snapshots() {
   if [[ ! -f "$SNAPSHOT_FILE" ]]; then
     echo -e "${C_DIM}No snapshot found. Run 'tm save' to create one.${C_RESET}"
@@ -1391,18 +1545,52 @@ _cmd_snapshots() {
 
   _check_cmd python3
 
-  python3 -c "
-import json
-d = json.load(open('$SNAPSHOT_FILE'))
-print(f\"Snapshot: {d['timestamp']}\")
-print(f\"Sessions: {len(d['sessions'])}\")
-print()
-print(f\"{'Name':<30} {'Claude':<8} {'Mode':<10} Path\")
-print('─' * 80)
-for s in d['sessions']:
-    claude = 'yes' if s['has_claude'] else 'no'
-    print(f\"{s['name']:<30} {claude:<8} {s['claude_mode']:<10} {s['path']}\")
-"
+  local py_show
+  py_show=$(cat <<'PY'
+import json, os, sys
+
+path = sys.argv[1]
+d = json.load(open(path))
+version = d.get("version", 1)
+if version < 2:
+    print(f"Snapshot is in legacy format (version {version}).")
+    print("Run 'tm save' again to upgrade to v2 (full window/pane tree).")
+    sys.exit(0)
+
+sessions = d.get("sessions", [])
+n_sess = len(sessions)
+n_win  = sum(len(s.get("windows", [])) for s in sessions)
+n_pane = sum(len(w.get("panes", [])) for s in sessions for w in s.get("windows", []))
+
+print(f"Snapshot: {d.get('timestamp', '?')}")
+print(f"Sessions: {n_sess} · Windows: {n_win} · Panes: {n_pane}")
+
+home = os.environ.get("HOME", "")
+def short(p):
+    return p.replace(home, "~", 1) if home and p.startswith(home) else p
+
+for s in sessions:
+    print()
+    print(f"▸ {s['name']}  (active window: {s.get('active_window', 0)})")
+    windows = s.get("windows", [])
+    for wi, w in enumerate(windows):
+        is_last_w = (wi == len(windows) - 1)
+        w_branch = "└" if is_last_w else "├"
+        w_cont   = " " if is_last_w else "│"
+        wname = w.get("name") or "(unnamed)"
+        panes = w.get("panes", [])
+        layout = w.get("layout", "") or "-"
+        if len(layout) > 24:
+            layout = layout[:21] + "..."
+        print(f"  {w_branch} [{w['index']}] {wname:<14} layout={layout} ({len(panes)} panes, active={w.get('active_pane',0)})")
+        for pi, p in enumerate(panes):
+            is_last_p = (pi == len(panes) - 1)
+            p_branch = "└" if is_last_p else "├"
+            claude = f"yes({p.get('claude_mode','fresh')})" if p.get("has_claude") else "no"
+            print(f"  {w_cont}   {p_branch} pane {p['index']}  claude={claude:<14} {short(p.get('path',''))}")
+PY
+)
+  python3 -c "$py_show" "$SNAPSHOT_FILE"
 }
 
 # ─── 12. Self-routing ─────────────────────────────────
