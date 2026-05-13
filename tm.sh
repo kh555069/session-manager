@@ -590,35 +590,9 @@ _cmd_create() {
   echo -e "${C_BOLD}╰────────────────────────────────────╯${C_RESET}"
   echo ""
 
-  # Session name
-  echo -e "${C_CYAN}Session name:${C_RESET}"
-  echo -n "> "
-  read -r sess_name
-
-  if [[ -z "$sess_name" ]]; then
-    echo -e "${C_RED}✗ Name cannot be empty${C_RESET}"
-    sleep 0.8
-    return 1
-  fi
-
-  # Validate name (no spaces, dots, colons)
-  if [[ "$sess_name" =~ [\ \.\:] ]]; then
-    echo -e "${C_RED}✗ Name cannot contain spaces, dots, or colons${C_RESET}"
-    sleep 0.8
-    return 1
-  fi
-
-  # Check for duplicates
-  if tmux has-session -t "$sess_name" 2>/dev/null; then
-    echo -e "${C_RED}✗ Session '${sess_name}' already exists${C_RESET}"
-    sleep 0.8
-    return 1
-  fi
-
   # Pick project directory via fzf (macOS compatible: ls instead of find -printf)
   local sess_dir=""
   if [[ -d "$PROJECT_BASE" ]]; then
-    echo ""
     echo -e "${C_CYAN}Select project directory (ESC to skip):${C_RESET}"
     local selected
     selected=$(
@@ -658,6 +632,34 @@ _cmd_create() {
     fi
   fi
   sess_dir="${sess_dir:-$HOME}"
+
+  # Session name (default = directory basename; press Enter to accept)
+  local default_name="${sess_dir##*/}"
+  echo ""
+  echo -e "${C_CYAN}Session name [${default_name}]:${C_RESET}"
+  echo -n "> "
+  read -r sess_name
+  sess_name="${sess_name:-$default_name}"
+
+  if [[ -z "$sess_name" ]]; then
+    echo -e "${C_RED}✗ Name cannot be empty${C_RESET}"
+    sleep 0.8
+    return 1
+  fi
+
+  # Validate name (no spaces, dots, colons)
+  if [[ "$sess_name" =~ [\ \.\:] ]]; then
+    echo -e "${C_RED}✗ Name cannot contain spaces, dots, or colons${C_RESET}"
+    sleep 0.8
+    return 1
+  fi
+
+  # Check for duplicates
+  if tmux has-session -t "$sess_name" 2>/dev/null; then
+    echo -e "${C_RED}✗ Session '${sess_name}' already exists${C_RESET}"
+    sleep 0.8
+    return 1
+  fi
 
   # Create session
   tmux new-session -d -s "$sess_name" -c "$sess_dir"
