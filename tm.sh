@@ -13,6 +13,13 @@ if ! command -v tmux &>/dev/null; then
 fi
 set -euo pipefail
 
+# Force a UTF-8 locale. Under cron the locale is unset; tmux then treats the TAB
+# separators in our -F format strings (e.g. `tm save`) as control chars and
+# rewrites them to '_', breaking `IFS=$'\t' read` splitting and yielding an
+# empty snapshot. Manual runs work only because the login shell sets LANG.
+export LANG="${LANG:-en_US.UTF-8}"
+export LC_ALL="${LC_ALL:-$LANG}"
+
 # ─── 1. Constants ──────────────────────────────────────
 
 readonly VERSION="1.0.0"
