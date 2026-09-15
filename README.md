@@ -20,6 +20,8 @@
 
 ## Demo
 
+![tm session manager interface](docs/images/tm-demo.png)
+
 ```
 ╭──────────────── tmux session manager v1.0.0 ──────────────────╮
 │ Keys: ↵Enter │ Tab Multi-sel │ ^N New │ ^K Kill │ ^P Protect  │
