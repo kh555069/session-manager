@@ -63,7 +63,7 @@ Status indicators:  [▸] current   [●] attached   [○] idle   🔒 protected
 | | Feature | Description |
 |---|---|---|
 | 🤖 | **AI Summaries** | Auto-generate session purpose summaries with Claude Haiku |
-| 💾 | **Backup & Restore** | Snapshot sessions with Claude Code state, restore after reboot |
+| 💾 | **Backup & Restore** | Snapshot sessions with Claude Code and Codex state, restore after reboot |
 | 🌳 | **Process Tree** | See every pane's shell and child processes with CPU/RAM |
 | 🔒 | **Protection Lock** | Prevent critical sessions from accidental termination |
 | ⚡ | **Smart Sorting** | Most recently used sessions always on top |
@@ -165,9 +165,11 @@ tm templates                # List available templates
 tm protect myapp            # Toggle protection status
 tm summarize myapp          # Generate AI summary for a session
 tm summarize-all            # Generate AI summaries for all sessions
+tm install-claude-hook      # Enable exact Claude session ID tracking
 tm save                     # Snapshot all sessions (for restore after reboot)
 tm restore                  # Restore sessions from snapshot
 tm restore --claude         # Restore sessions and auto-launch Claude Code
+tm restore --codex          # Restore sessions and resume Codex
 tm snapshots                # Show latest snapshot contents
 tm help                     # Show help
 ```
@@ -215,18 +217,25 @@ Three layers of protection to prevent accidental session termination:
 ---
 
 <details>
-<summary><strong>Backup & Restore</strong> — Survive reboots with Claude Code state</summary>
+<summary><strong>Backup & Restore</strong> — Survive reboots with Claude Code and Codex state</summary>
 
 ### How it works
 
-`tm save` captures a JSON snapshot of every session — name, working directory, and whether Claude Code is running (with `continue` vs `fresh` mode detection based on `~/.claude/projects/`).
+`tm save` captures a JSON snapshot of every session — name, working directory, running agent, and the exact Claude Code or Codex session ID when available. Restore uses the recorded ID first, so multiple agent sessions in the same working directory remain distinct.
+
+Install the Claude `SessionStart` hook once to map each tmux pane to its session ID. The installer preserves existing settings and hooks, and creates a timestamped backup before changing an existing `~/.claude/settings.json`. The hook records only the pane ID, session UUID, working directory, and timestamp — never conversation content.
 
 ```bash
+tm install-claude-hook   # One-time setup for exact Claude session tracking
 tm save                  # Snapshot all sessions
 tm restore               # Recreate sessions from snapshot (skip existing)
 tm restore --claude      # Also auto-launch Claude Code where it was running
+tm restore --codex       # Also resume Codex where it was running
+tm restore --claude --codex  # Restore both agents
 tm snapshots             # Preview the latest snapshot
 ```
+
+Codex IDs are detected directly from the running pane. If an exact ID is unavailable, restore falls back to Claude's `--continue` behavior or Codex's directory-scoped `--last` behavior.
 
 Snapshot is saved to `<tm-dir>/snapshots/sessions.json` (next to `tm.sh`), with the previous version rotated to `sessions.json.bak`. This keeps backup data inside the project directory and avoids overwriting any existing user backups.
 
@@ -283,6 +292,7 @@ session-manager/
 └── ~/.tmux-manager/                   # Runtime data (auto-created)
     ├── protected.txt                  # Protected session list
     ├── last_session                   # Last session record
+    ├── claude_sessions.jsonl          # tmux pane to Claude session ID records
     ├── templates/                     # Session template directory
     │   └── dev                        # Default dev template (editor/server/logs)
     └── summaries/                     # AI summary history (JSONL)

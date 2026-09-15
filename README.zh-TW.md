@@ -64,7 +64,7 @@
 | | 功能 | 說明 |
 |---|---|---|
 | 🤖 | **AI 摘要** | 透過 Claude Haiku 自動產生 session 用途摘要 |
-| 💾 | **備份與還原** | 備份 session 含 Claude Code 狀態，重開機後可還原 |
+| 💾 | **備份與還原** | 備份 session 含 Claude Code 與 Codex 狀態，重開機後可還原 |
 | 🌳 | **程序樹** | 顯示每個 pane 的 shell 及子程序，含 CPU/RAM |
 | 🔒 | **保護鎖** | 防止關鍵 session 被意外終止 |
 | ⚡ | **智慧排序** | 最近使用的 session 永遠在最上面 |
@@ -166,9 +166,11 @@ tm templates                # 列出可用模板
 tm protect myapp            # 切換保護狀態
 tm summarize myapp          # 產生單一 session 的 AI 摘要
 tm summarize-all            # 產生所有 session 的 AI 摘要
+tm install-claude-hook      # 啟用精確的 Claude session ID 追蹤
 tm save                     # 備份所有 session（重開機後可還原）
 tm restore                  # 從快照還原 session
 tm restore --claude         # 還原 session 並自動啟動 Claude Code
+tm restore --codex          # 還原 session 並續接 Codex
 tm snapshots                # 顯示最新快照內容
 tm help                     # 說明
 ```
@@ -216,18 +218,25 @@ cp completions/tm.zsh ~/.zsh/completions/_tm
 ---
 
 <details>
-<summary><strong>備份與還原</strong> — 重開機後保留 Claude Code 狀態</summary>
+<summary><strong>備份與還原</strong> — 重開機後保留 Claude Code 與 Codex 狀態</summary>
 
 ### 運作方式
 
-`tm save` 會將每個 session 的名稱、工作目錄，以及 Claude Code 狀態（根據 `~/.claude/projects/` 偵測是否為 `continue` 或 `fresh` 模式）寫入 JSON 快照。
+`tm save` 會將每個 session 的名稱、工作目錄、執行中的 agent，以及可取得的 Claude Code 或 Codex 精確 session ID 寫入 JSON 快照。還原時會優先使用記錄的 ID，因此即使同一工作目錄有多個 agent session，也能分別續接。
+
+首次使用前執行一次 Claude `SessionStart` hook 安裝指令，建立 tmux pane 與 session ID 的對應。安裝器會保留既有設定與 hooks，修改既有 `~/.claude/settings.json` 前也會建立含時間戳的備份。hook 只記錄 pane ID、session UUID、工作目錄與時間戳，不會讀取對話內容。
 
 ```bash
+tm install-claude-hook   # 一次性設定，啟用精確 Claude session 追蹤
 tm save                  # 備份所有 session
 tm restore               # 從快照還原（已存在的 session 會跳過）
 tm restore --claude      # 還原 session 並自動啟動 Claude Code
+tm restore --codex       # 還原 session 並續接 Codex
+tm restore --claude --codex  # 同時還原兩種 agent
 tm snapshots             # 預覽最新快照
 ```
+
+Codex ID 會直接從執行中的 pane 偵測。若無法取得精確 ID，還原時會退回 Claude 的 `--continue` 或 Codex 依工作目錄選取的 `--last` 行為。
 
 快照儲存於 `<tm-dir>/snapshots/sessions.json`（與 `tm.sh` 同層目錄），前一版會輪替為 `sessions.json.bak`。備份資料存在專案目錄內，不會覆蓋使用者既有的備份。
 
@@ -284,6 +293,7 @@ session-manager/
 └── ~/.tmux-manager/                   # 執行時資料（自動建立）
     ├── protected.txt                  # 受保護的 session 名單
     ├── last_session                   # 上一個 session 記錄
+    ├── claude_sessions.jsonl          # tmux pane 與 Claude session ID 紀錄
     ├── templates/                     # Session 模板目錄
     │   └── dev                        # 預設 dev 模板（editor/server/logs）
     └── summaries/                     # AI 摘要歷史（JSONL）
