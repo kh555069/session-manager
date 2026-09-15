@@ -33,7 +33,9 @@ fi
 readonly SELF="$_self"
 readonly CONFIG_DIR="${HOME}/.tmux-manager"
 readonly PROTECTED_FILE="${CONFIG_DIR}/protected.txt"
+readonly CLAUDE_SESSION_MAP="${CONFIG_DIR}/claude_sessions.jsonl"
 readonly CLAUDE_PROJECTS="${HOME}/.claude/projects"
+readonly CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
 readonly SCRIPT_DIR="${SELF%/*}"
 readonly SNAPSHOT_DIR="${SCRIPT_DIR}/snapshots"
 readonly SNAPSHOT_FILE="${SNAPSHOT_DIR}/sessions.json"
@@ -54,7 +56,7 @@ readonly C_BG_RED=$'\033[41m'
 readonly C_BG_YELLOW=$'\033[43m'
 
 # Processes that trigger a warning before kill
-readonly IMPORTANT_PROCS="claude|python|node|npm|cargo|go|java|docker|kubectl"
+readonly IMPORTANT_PROCS="claude|codex|python|node|npm|cargo|go|java|docker|kubectl"
 
 # Performance cache for batch queries (populated by _build_list_cache)
 _CACHED_SESSION_DATA=""
@@ -903,7 +905,8 @@ ${C_BOLD}Usage:${C_RESET}
   tm summarize <name>   Generate AI summary for a session
   tm summarize-all      Generate AI summaries for all sessions
   tm save               Snapshot all sessions, windows, panes & layouts
-  tm restore [--claude] Restore full session tree (--claude: relaunch Claude per pane)
+  tm restore [--claude] [--codex]  Restore full session tree and optionally relaunch agents
+  tm install-claude-hook  Install exact Claude session ID tracking
   tm snapshots          Show latest snapshot contents (sessions → windows → panes)
   tm help               Show this help
 
@@ -1239,6 +1242,108 @@ _cmd_summarize_all() {
 
 # ─── 11. Backup & Restore ─────────────────────────────
 
+# Receive Claude SessionStart hook input and record pane-to-session metadata.
+_cmd_record_claude_session() {
+  [[ -n "${TMUX_PANE:-}" ]] || return 0
+  command -v python3 &>/dev/null || return 0
+
+  local record
+  record=$(python3 -c '
+import json, os, sys, time, uuid
+
+try:
+    payload = json.load(sys.stdin)
+    session_id = payload.get("session_id", "")
+    if str(uuid.UUID(session_id)) != session_id.lower():
+        raise ValueError("invalid session ID")
+    print(json.dumps({
+        "pane_id": os.environ["TMUX_PANE"],
+        "session_id": session_id,
+        "cwd": payload.get("cwd", ""),
+        "updated_at": int(time.time()),
+    }, separators=(",", ":")))
+except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    pass
+' 2>/dev/null) || return 0
+
+  if [[ -n "$record" ]]; then
+    if [[ ! -f "$CLAUDE_SESSION_MAP" ]]; then
+      (umask 077; touch "$CLAUDE_SESSION_MAP")
+    fi
+    printf '%s\n' "$record" >> "$CLAUDE_SESSION_MAP"
+  fi
+}
+
+# Safely merge tm's SessionStart recorder into the user's Claude settings.
+_cmd_install_claude_hook() {
+  _check_cmd python3
+  mkdir -p "${CLAUDE_SETTINGS%/*}"
+
+  python3 -c '
+import datetime, json, os, shlex, shutil, sys, uuid
+
+settings_path, script_path = sys.argv[1:]
+command = f"{shlex.quote(script_path)} _record-claude-session"
+existed = os.path.isfile(settings_path)
+
+if existed:
+    try:
+        with open(settings_path) as settings_file:
+            data = json.load(settings_file)
+    except (OSError, ValueError) as error:
+        print(f"Failed to read Claude settings: {error}", file=sys.stderr)
+        sys.exit(1)
+else:
+    data = {}
+
+if not isinstance(data, dict):
+    print("Failed to update Claude settings: root value must be an object", file=sys.stderr)
+    sys.exit(1)
+
+hooks = data.setdefault("hooks", {})
+if not isinstance(hooks, dict):
+    print("Failed to update Claude settings: hooks must be an object", file=sys.stderr)
+    sys.exit(1)
+
+session_start = hooks.setdefault("SessionStart", [])
+if not isinstance(session_start, list):
+    print("Failed to update Claude settings: hooks.SessionStart must be an array", file=sys.stderr)
+    sys.exit(1)
+
+for group in session_start:
+    if not isinstance(group, dict):
+        continue
+    for hook in group.get("hooks", []):
+        if isinstance(hook, dict) and "_record-claude-session" in hook.get("command", ""):
+            print("Claude SessionStart hook is already installed")
+            sys.exit(0)
+
+session_start.append({
+    "hooks": [{
+        "type": "command",
+        "command": command,
+    }],
+})
+
+backup_path = ""
+if existed:
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    backup_path = f"{settings_path}.tm-backup-{stamp}"
+    shutil.copy2(settings_path, backup_path)
+
+temp_path = f"{settings_path}.tm-new-{uuid.uuid4()}"
+with open(temp_path, "x") as settings_file:
+    json.dump(data, settings_file, indent=2)
+    settings_file.write("\n")
+os.chmod(temp_path, os.stat(settings_path).st_mode & 0o777 if existed else 0o600)
+os.replace(temp_path, settings_path)
+
+print(f"Installed Claude SessionStart hook in {settings_path}")
+if backup_path:
+    print(f"Backup: {backup_path}")
+' "$CLAUDE_SETTINGS" "$SELF"
+}
+
 # Check if a Claude Code conversation exists for a project path
 _has_conversation() {
   local project_path="$1"
@@ -1249,14 +1354,105 @@ _has_conversation() {
   [[ -d "$conv_dir" ]] && compgen -G "${conv_dir}/*.jsonl" >/dev/null 2>&1
 }
 
+_is_uuid() {
+  [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+# List a tmux pane's shell PID and every descendant process.
+_pane_process_pids() {
+  local root_pid="$1"
+  local current child index=0
+  local -a queue=("$root_pid")
+
+  while (( index < ${#queue[@]} )); do
+    current="${queue[$index]}"
+    ((index += 1))
+    echo "$current"
+    while IFS= read -r child; do
+      [[ -z "$child" ]] && continue
+      queue+=("$child")
+    done < <(pgrep -P "$current" 2>/dev/null || true)
+  done
+}
+
 # Detect whether a specific pane is running Claude Code (by pane_pid)
 _pane_has_claude() {
   local pane_pid="$1"
   local children c
-  children=$(pgrep -P "$pane_pid" 2>/dev/null) || return 1
+  children=$(_pane_process_pids "$pane_pid")
   [[ -z "$children" ]] && return 1
-  c=$(ps -o command= -p $children 2>/dev/null | grep -c "claude" || true)
+  children="${children//$'\n'/,}"
+  c=$(ps -o command= -p "$children" 2>/dev/null | grep -c "claude" || true)
   [[ "$c" -gt 0 ]]
+}
+
+# Detect whether a specific pane is running Codex CLI (by pane_pid)
+_pane_has_codex() {
+  local pane_pid="$1"
+  local children c
+  children=$(_pane_process_pids "$pane_pid")
+  [[ -z "$children" ]] && return 1
+  children="${children//$'\n'/,}"
+  c=$(ps -o command= -p "$children" 2>/dev/null | grep -cE '(^|[ /])codex( |$)' || true)
+  [[ "$c" -gt 0 ]]
+}
+
+# Read the exact Codex session UUID from a pane descendant's open rollout file.
+_pane_codex_session_id() {
+  local pane_pid="$1"
+  local pid fd path filename candidate files
+  local lsof_path=""
+  lsof_path=$(command -v lsof || true)
+
+  while IFS= read -r pid; do
+    [[ -z "$pid" ]] && continue
+    files=""
+    if [[ -d "/proc/${pid}/fd" ]]; then
+      for fd in "/proc/${pid}/fd/"*; do
+        path=$(readlink "$fd" 2>/dev/null || true)
+        [[ -n "$path" ]] && files+="${path}"$'\n'
+      done
+    elif [[ -n "$lsof_path" ]]; then
+      files=$("$lsof_path" -a -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' || true)
+    fi
+
+    while IFS= read -r path; do
+      [[ "$path" == */sessions/*/rollout-*.jsonl ]] || continue
+      filename="${path##*/}"
+      candidate="${filename%.jsonl}"
+      candidate="${candidate: -36}"
+      if _is_uuid "$candidate"; then
+        echo "$candidate"
+        return 0
+      fi
+    done <<< "$files"
+  done < <(_pane_process_pids "$pane_pid")
+
+  return 1
+}
+
+# Look up the latest Claude hook record for a tmux pane and working directory.
+_pane_claude_session_id() {
+  local pane_id="$1"
+  local pane_path="$2"
+  [[ -f "$CLAUDE_SESSION_MAP" ]] || return 1
+
+  python3 -c '
+import json, sys
+
+path, pane_id, pane_path = sys.argv[1:]
+session_id = ""
+with open(path) as records:
+    for line in records:
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if record.get("pane_id") == pane_id and record.get("cwd") == pane_path:
+            session_id = record.get("session_id", "")
+if session_id:
+    print(session_id)
+' "$CLAUDE_SESSION_MAP" "$pane_id" "$pane_path"
 }
 
 # Detect whether any pane in a session is running Claude Code
@@ -1291,29 +1487,43 @@ _cmd_save() {
 
   # Build TSV stream: one line per pane.
   # Fields: SESSION \t WIN_IDX \t WIN_NAME \t WIN_ACTIVE \t WIN_LAYOUT \t
-  #         PANE_IDX \t PANE_ACTIVE \t PANE_PATH \t HAS_CLAUDE \t CLAUDE_MODE
+  #         PANE_IDX \t PANE_ACTIVE \t PANE_PATH \t HAS_CLAUDE \t CLAUDE_MODE \t
+  #         CLAUDE_SESSION_ID \t HAS_CODEX \t CODEX_SESSION_ID
   local tsv=""
   local session win_line win_idx win_name win_active win_layout
-  local pane_line pane_idx pane_active pane_path pane_pid has_claude claude_mode
+  local pane_line pane_idx pane_active pane_path pane_pid pane_id
+  local has_claude claude_mode claude_session_id has_codex codex_session_id
 
   while IFS= read -r session; do
     [[ -z "$session" ]] && continue
     while IFS=$'\t' read -r win_idx win_name win_active win_layout; do
       [[ -z "$win_idx" ]] && continue
-      while IFS=$'\t' read -r pane_idx pane_active pane_path pane_pid; do
+      while IFS=$'\t' read -r pane_idx pane_active pane_path pane_pid pane_id; do
         [[ -z "$pane_idx" || -z "$pane_path" ]] && continue
         if _pane_has_claude "$pane_pid"; then
           has_claude=true
+          claude_session_id=$(_pane_claude_session_id "$pane_id" "$pane_path" || true)
+          if [[ -n "$claude_session_id" ]] && ! _is_uuid "$claude_session_id"; then
+            claude_session_id=""
+          fi
         else
           has_claude=false
+          claude_session_id=""
         fi
         if _has_conversation "$pane_path"; then
           claude_mode="continue"
         else
           claude_mode="fresh"
         fi
-        tsv+="${session}"$'\t'"${win_idx}"$'\t'"${win_name}"$'\t'"${win_active}"$'\t'"${win_layout}"$'\t'"${pane_idx}"$'\t'"${pane_active}"$'\t'"${pane_path}"$'\t'"${has_claude}"$'\t'"${claude_mode}"$'\n'
-      done < <(tmux list-panes -t "${session}:${win_idx}" -F '#{pane_index}	#{?pane_active,1,0}	#{pane_current_path}	#{pane_pid}' 2>/dev/null)
+        if _pane_has_codex "$pane_pid"; then
+          has_codex=true
+          codex_session_id=$(_pane_codex_session_id "$pane_pid" || true)
+        else
+          has_codex=false
+          codex_session_id=""
+        fi
+        tsv+="${session}"$'\t'"${win_idx}"$'\t'"${win_name}"$'\t'"${win_active}"$'\t'"${win_layout}"$'\t'"${pane_idx}"$'\t'"${pane_active}"$'\t'"${pane_path}"$'\t'"${has_claude}"$'\t'"${claude_mode}"$'\t'"${claude_session_id}"$'\t'"${has_codex}"$'\t'"${codex_session_id}"$'\n'
+      done < <(tmux list-panes -t "${session}:${win_idx}" -F '#{pane_index}	#{?pane_active,1,0}	#{pane_current_path}	#{pane_pid}	#{pane_id}' 2>/dev/null)
     done < <(tmux list-windows -t "$session" -F '#{window_index}	#{window_name}	#{?window_active,1,0}	#{window_layout}' 2>/dev/null)
   done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
 
@@ -1330,9 +1540,9 @@ for line in sys.stdin.read().splitlines():
     if not line:
         continue
     parts = line.split('\t')
-    if len(parts) != 10:
+    if len(parts) != 13:
         continue
-    sname, w_idx, w_name, w_active, w_layout, p_idx, p_active, p_path, has_cl, cl_mode = parts
+    sname, w_idx, w_name, w_active, w_layout, p_idx, p_active, p_path, has_cl, cl_mode, cl_session, has_codex, codex_session = parts
     w_idx_i = int(w_idx)
     p_idx_i = int(p_idx)
     s = sessions.setdefault(sname, {"name": sname, "active_window": 0, "windows": {}})
@@ -1349,6 +1559,9 @@ for line in sys.stdin.read().splitlines():
         "path": p_path,
         "has_claude": has_cl == "true",
         "claude_mode": cl_mode,
+        "claude_session_id": cl_session or None,
+        "has_codex": has_codex == "true",
+        "codex_session_id": codex_session or None,
     }
 
 out_sessions = []
@@ -1386,9 +1599,19 @@ PY
 # Restore sessions from snapshot (full session/window/pane tree)
 _cmd_restore() {
   local start_claude=false
-  if [[ "${1:-}" == "--claude" ]]; then
-    start_claude=true
-  fi
+  local start_codex=false
+  local option
+  for option in "$@"; do
+    case "$option" in
+      --claude) start_claude=true ;;
+      --codex)  start_codex=true ;;
+      *)
+        echo -e "${C_RED}✗ Unknown restore option: ${option}${C_RESET}" >&2
+        echo -e "${C_DIM}  Usage: tm restore [--claude] [--codex]${C_RESET}" >&2
+        return 1
+        ;;
+    esac
+  done
 
   if [[ ! -f "$SNAPSHOT_FILE" ]]; then
     echo -e "${C_RED}✗ No snapshot found at ${SNAPSHOT_FILE}${C_RESET}" >&2
@@ -1407,11 +1630,12 @@ _cmd_restore() {
   # prints colored status lines to stdout, returns a summary on the last line.
   local py_restore
   py_restore=$(cat <<'PY'
-import json, os, subprocess, sys
+import json, os, shlex, subprocess, sys, uuid
 
 SNAPSHOT  = sys.argv[1]
 START_CL  = sys.argv[2] == "true"
-EXISTING  = set(filter(None, sys.argv[3].splitlines())) if len(sys.argv) > 3 else set()
+START_CX  = sys.argv[3] == "true"
+EXISTING  = set(filter(None, sys.argv[4].splitlines())) if len(sys.argv) > 4 else set()
 
 # ANSI color codes (must match bash C_* constants)
 G  = "\033[32m"; R  = "\033[31m"; Y = "\033[33m"
@@ -1440,9 +1664,16 @@ def tmux(*args, check=True):
 def safe_path(p):
     return p if (p and os.path.isdir(p)) else os.environ.get("HOME", "/")
 
+def valid_session_id(value):
+    try:
+        return str(uuid.UUID(value)) == value.lower()
+    except (AttributeError, TypeError, ValueError):
+        return False
+
 n_sess = n_win = n_pane = 0
 n_skip = 0
 n_claude = 0
+n_codex = 0
 
 for s in data.get("sessions", []):
     sname = s["name"]
@@ -1508,22 +1739,40 @@ for s in data.get("sessions", []):
             for p in w.get("panes", []):
                 if not p.get("has_claude"):
                     continue
-                cmd = "claude --continue --dangerously-skip-permissions" if p.get("claude_mode") == "continue" \
-                      else "claude --dangerously-skip-permissions"
+                session_id = p.get("claude_session_id")
+                if valid_session_id(session_id):
+                    cmd = f"claude --resume {shlex.quote(session_id)} --dangerously-skip-permissions"
+                elif p.get("claude_mode") == "continue":
+                    cmd = "claude --continue --dangerously-skip-permissions"
+                else:
+                    cmd = "claude --dangerously-skip-permissions"
                 target = f"{sname}:{w['index']}.{p['index']}"
                 tmux("send-keys", "-t", target, cmd, "Enter")
                 n_claude += 1
+
+    # Stage 4: resume Codex per-pane if requested
+    if START_CX:
+        for w in windows:
+            for p in w.get("panes", []):
+                if not p.get("has_codex"):
+                    continue
+                target = f"{sname}:{w['index']}.{p['index']}"
+                session_id = p.get("codex_session_id")
+                cmd = f"codex resume {shlex.quote(session_id)}" if valid_session_id(session_id) \
+                      else "codex resume --last"
+                tmux("send-keys", "-t", target, cmd, "Enter")
+                n_codex += 1
 
     # Finally: set active window
     tmux("select-window", "-t", f"{sname}:{s.get('active_window', 0)}")
 
 # Summary line (parsed by bash caller)
-print(f"__SUMMARY__\t{n_sess}\t{n_win}\t{n_pane}\t{n_skip}\t{n_claude}")
+print(f"__SUMMARY__\t{n_sess}\t{n_win}\t{n_pane}\t{n_skip}\t{n_claude}\t{n_codex}")
 PY
 )
 
-  local out summary n_sess n_win n_pane n_skip n_claude
-  out=$(python3 -c "$py_restore" "$SNAPSHOT_FILE" "$start_claude" "$existing")
+  local out summary n_sess n_win n_pane n_skip n_claude n_codex
+  out=$(python3 -c "$py_restore" "$SNAPSHOT_FILE" "$start_claude" "$start_codex" "$existing")
   local rc=$?
   if [[ $rc -ne 0 ]]; then
     echo "$out"
@@ -1534,12 +1783,15 @@ PY
   summary=$(printf '%s\n' "$out" | grep '^__SUMMARY__' | head -n1)
   printf '%s\n' "$out" | grep -v '^__SUMMARY__'
 
-  IFS=$'\t' read -r _ n_sess n_win n_pane n_skip n_claude <<<"$summary"
+  IFS=$'\t' read -r _ n_sess n_win n_pane n_skip n_claude n_codex <<<"$summary"
 
   echo ""
   echo -e "${C_BOLD}Done:${C_RESET} ${n_sess:-0} sessions · ${n_win:-0} windows · ${n_pane:-0} panes restored, ${n_skip:-0} skipped"
   if [[ "${n_claude:-0}" -gt 0 ]]; then
     echo -e "${C_BOLD}Claude Code started in ${n_claude} panes${C_RESET}"
+  fi
+  if [[ "${n_codex:-0}" -gt 0 ]]; then
+    echo -e "${C_BOLD}Codex resumed in ${n_codex} panes${C_RESET}"
   fi
 }
 
@@ -1593,8 +1845,13 @@ for s in sessions:
         for pi, p in enumerate(panes):
             is_last_p = (pi == len(panes) - 1)
             p_branch = "└" if is_last_p else "├"
-            claude = f"yes({p.get('claude_mode','fresh')})" if p.get("has_claude") else "no"
-            print(f"  {w_cont}   {p_branch} pane {p['index']}  claude={claude:<14} {short(p.get('path',''))}")
+            claude_id = p.get("claude_session_id")
+            codex_id = p.get("codex_session_id")
+            claude = f"yes({claude_id[:8]})" if claude_id else \
+                     (f"yes({p.get('claude_mode','fresh')})" if p.get("has_claude") else "no")
+            codex = f"yes({codex_id[:8]})" if codex_id else \
+                    ("yes(last)" if p.get("has_codex") else "no")
+            print(f"  {w_cont}   {p_branch} pane {p['index']}  claude={claude:<14} codex={codex:<11} {short(p.get('path',''))}")
 PY
 )
   python3 -c "$py_show" "$SNAPSHOT_FILE"
@@ -1615,6 +1872,7 @@ case "${1:-}" in
   _detach-others)  _cmd_detach_others "${2:-}" ;;
   _create)         _cmd_create ;;
   _summarize)      _cmd_summarize "${2:-}" ;;
+  _record-claude-session) _cmd_record_claude_session ;;
 
   # User-facing CLI commands (only need tmux, not fzf)
   new|create)      _check_cmd tmux; _cmd_quick_new "${@:2}" ;;
@@ -1628,7 +1886,8 @@ case "${1:-}" in
   summarize)       _check_cmd tmux; _cmd_summarize "${2:-}" ;;
   summarize-all)   _check_cmd tmux; _cmd_summarize_all ;;
   save)            _check_cmd tmux; _cmd_save ;;
-  restore)         _check_cmd tmux; _cmd_restore "${2:-}" ;;
+  restore)         _check_cmd tmux; _cmd_restore "${@:2}" ;;
+  install-claude-hook) _cmd_install_claude_hook ;;
   snapshots|snaps) _cmd_snapshots ;;
   help|--help|-h)  _cmd_help ;;
   --version|-v)    echo "tm v${VERSION}" ;;
