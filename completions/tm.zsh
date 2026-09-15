@@ -39,6 +39,7 @@ _tm() {
     'summarize-all:Generate AI summaries for all sessions'
     'save:Snapshot all sessions for restore after reboot'
     'restore:Restore sessions from snapshot'
+    'install-claude-hook:Install exact Claude session ID tracking'
     'snapshots:Show latest snapshot contents'
     'help:Show usage information'
   )
@@ -78,9 +79,10 @@ _tm() {
       ;;
     restore)
       _arguments -s \
-        '--claude[Auto-launch Claude Code after restore]' && ret=0
+        '--claude[Auto-launch Claude Code after restore]' \
+        '--codex[Resume Codex after restore]' && ret=0
       ;;
-    ls|list|last|templates|tpl|summarize-all|save|snapshots|snaps|help)
+    ls|list|last|templates|tpl|summarize-all|save|install-claude-hook|snapshots|snaps|help)
       # No further arguments
       ;;
   esac
