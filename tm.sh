@@ -1670,6 +1670,33 @@ def valid_session_id(value):
     except (AttributeError, TypeError, ValueError):
         return False
 
+def restore_window(sname, window):
+    target = f"{sname}:{window['index']}"
+    panes = window.get("panes", [])
+    created = 1
+    for pane in panes[1:]:
+        _, err = tmux("split-window", "-t", target, "-c", safe_path(pane["path"]))
+        if err is not None:
+            return created, f"pane {pane['index']} split: {err}"
+        created += 1
+
+        # Rebalance after every split so the active pane never becomes too
+        # small to split again. The saved layout is applied after all panes
+        # exist, preserving its exact tree and proportions.
+        _, err = tmux("select-layout", "-t", target, "tiled")
+        if err is not None:
+            return created, f"temporary tiled layout: {err}"
+
+    if window.get("layout"):
+        _, err = tmux("select-layout", "-t", target, window["layout"])
+        if err is not None:
+            return created, f"saved layout: {err}"
+
+    _, err = tmux("select-pane", "-t", f"{target}.{window.get('active_pane', 0)}")
+    if err is not None:
+        return created, f"active pane: {err}"
+    return created, None
+
 n_sess = n_win = n_pane = 0
 n_skip = 0
 n_claude = 0
@@ -1703,35 +1730,42 @@ for s in data.get("sessions", []):
         n_skip += 1
         continue
 
+    # Stage 2a: window 0 — split remaining panes & apply layout
+    session_windows = 1
+    session_panes, restore_error = restore_window(sname, w0)
+
+    # Stage 1b + 2b: remaining windows
+    if restore_error is None:
+        for w in windows[1:]:
+            wp0 = w["panes"][0] if w.get("panes") else None
+            if not wp0:
+                continue
+            wname = w.get("name", "")
+            _, restore_error = tmux(
+                "new-window", "-t", f"{sname}:{w['index']}",
+                "-c", safe_path(wp0["path"]), "-n", wname,
+            )
+            if restore_error is not None:
+                restore_error = f"window {w['index']} creation: {restore_error}"
+                break
+            restored_panes, restore_error = restore_window(sname, w)
+            if restore_error is not None:
+                restore_error = f"window {w['index']} {restore_error}"
+                break
+            session_windows += 1
+            session_panes += restored_panes
+
+    if restore_error is not None:
+        tmux("kill-session", "-t", sname, check=False)
+        print(f"  {R}FAIL{X}  {sname} ({restore_error})")
+        n_skip += 1
+        continue
+
     pretty = base_path.replace(os.environ.get("HOME", ""), "~", 1) if os.environ.get("HOME") else base_path
     print(f"  {G}OK{X}    {sname} → {pretty}")
     n_sess += 1
-    n_win += 1
-    n_pane += 1
-
-    # Stage 2a: window 0 — split remaining panes & apply layout
-    for p in w0["panes"][1:]:
-        tmux("split-window", "-t", f"{sname}:{w0['index']}", "-c", safe_path(p["path"]))
-        n_pane += 1
-    if w0.get("layout"):
-        tmux("select-layout", "-t", f"{sname}:{w0['index']}", w0["layout"])
-    tmux("select-pane", "-t", f"{sname}:{w0['index']}.{w0.get('active_pane', 0)}")
-
-    # Stage 1b + 2b: remaining windows
-    for w in windows[1:]:
-        wp0 = w["panes"][0] if w.get("panes") else None
-        if not wp0:
-            continue
-        wname = w.get("name", "")
-        tmux("new-window", "-t", f"{sname}:{w['index']}", "-c", safe_path(wp0["path"]), "-n", wname)
-        n_win += 1
-        n_pane += 1
-        for p in w["panes"][1:]:
-            tmux("split-window", "-t", f"{sname}:{w['index']}", "-c", safe_path(p["path"]))
-            n_pane += 1
-        if w.get("layout"):
-            tmux("select-layout", "-t", f"{sname}:{w['index']}", w["layout"])
-        tmux("select-pane", "-t", f"{sname}:{w['index']}.{w.get('active_pane', 0)}")
+    n_win += session_windows
+    n_pane += session_panes
 
     # Stage 3: launch Claude per-pane if requested
     if START_CL:
