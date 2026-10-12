@@ -23,6 +23,15 @@ _tm_templates() {
   (( ${#templates} )) && compadd -X "templates" "$@" -- "${templates[@]}"
 }
 
+_tm_snapshots() {
+  # Locate tm.sh via alias or PATH; snapshots live next to it
+  local tm_bin="${aliases[tm]:-${commands[tm]}}"
+  [[ -n "$tm_bin" ]] || return 1
+  local -a snaps
+  snaps=( ${tm_bin:A:h}/snapshots/history/sessions-*.json(N:t) )
+  (( ${#snaps} )) && compadd -X "snapshots" "$@" -- "${(Oa)snaps[@]}"
+}
+
 _tm() {
   local curcontext="$curcontext" ret=1
 
@@ -40,7 +49,7 @@ _tm() {
     'save:Snapshot all sessions for restore after reboot'
     'restore:Restore sessions from snapshot'
     'install-claude-hook:Install exact Claude session ID tracking'
-    'snapshots:Show latest snapshot contents'
+    'snapshots:Show snapshot contents or history'
     'help:Show usage information'
   )
 
@@ -80,9 +89,15 @@ _tm() {
     restore)
       _arguments -s \
         '--claude[Auto-launch Claude Code after restore]' \
-        '--codex[Resume Codex after restore]' && ret=0
+        '--codex[Resume Codex after restore]' \
+        '--from[Restore from a history snapshot]:snapshot:_tm_snapshots' && ret=0
       ;;
-    ls|list|last|templates|tpl|summarize-all|save|install-claude-hook|snapshots|snaps|help)
+    snapshots|snaps)
+      _alternative \
+        'options:option:((--list\:"List snapshot history"))' \
+        'snapshots:snapshot:_tm_snapshots' && ret=0
+      ;;
+    ls|list|last|templates|tpl|summarize-all|save|install-claude-hook|help)
       # No further arguments
       ;;
   esac

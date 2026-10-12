@@ -39,6 +39,8 @@ readonly CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
 readonly SCRIPT_DIR="${SELF%/*}"
 readonly SNAPSHOT_DIR="${SCRIPT_DIR}/snapshots"
 readonly SNAPSHOT_FILE="${SNAPSHOT_DIR}/sessions.json"
+readonly SNAPSHOT_HISTORY_DIR="${SNAPSHOT_DIR}/history"
+readonly SNAPSHOT_KEEP="${TM_SNAPSHOT_KEEP:-48}"
 readonly PROJECT_BASE="${TM_PROJECT_BASE:-${SCRIPT_DIR%/*}}"
 readonly FZF="${SCRIPT_DIR}/fzf"
 unset _self
@@ -905,9 +907,11 @@ ${C_BOLD}Usage:${C_RESET}
   tm summarize <name>   Generate AI summary for a session
   tm summarize-all      Generate AI summaries for all sessions
   tm save               Snapshot all sessions, windows, panes & layouts
-  tm restore [--claude] [--codex]  Restore full session tree and optionally relaunch agents
+  tm restore [--claude] [--codex] [--from <snapshot>]
+                        Restore full session tree and optionally relaunch agents
   tm install-claude-hook  Install exact Claude session ID tracking
-  tm snapshots          Show latest snapshot contents (sessions → windows → panes)
+  tm snapshots [<snapshot>]  Show snapshot contents (latest by default)
+  tm snapshots --list   List timestamped snapshot history
   tm help               Show this help
 
 ${C_BOLD}Interactive menu shortcuts:${C_RESET}
@@ -924,6 +928,8 @@ ${C_BOLD}Interactive menu shortcuts:${C_RESET}
 ${C_BOLD}Environment variables:${C_RESET}
   TM_PROJECT_BASE    Root directory for project picker on new session
                      Default: two levels above tm.sh
+  TM_SNAPSHOT_KEEP   Number of timestamped snapshots kept by 'tm save'
+                     Default: 48
 EOF
 }
 
@@ -1475,15 +1481,14 @@ _cmd_save() {
   fi
 
   _check_cmd python3
-  mkdir -p "$SNAPSHOT_DIR"
+  if [[ ! "$SNAPSHOT_KEEP" =~ ^[1-9][0-9]*$ ]]; then
+    echo -e "${C_RED}✗ TM_SNAPSHOT_KEEP must be a positive integer (got: ${SNAPSHOT_KEEP})${C_RESET}" >&2
+    exit 1
+  fi
+  mkdir -p "$SNAPSHOT_HISTORY_DIR"
 
   local timestamp
   timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-  # Rotate previous snapshot
-  if [[ -f "$SNAPSHOT_FILE" ]]; then
-    cp "$SNAPSHOT_FILE" "${SNAPSHOT_FILE}.bak"
-  fi
 
   # Build TSV stream: one line per pane.
   # Fields: SESSION \t WIN_IDX \t WIN_NAME \t WIN_ACTIVE \t WIN_LAYOUT \t
@@ -1530,10 +1535,12 @@ _cmd_save() {
   # Group TSV into nested JSON via Python
   local py_save
   py_save=$(cat <<'PY'
-import json, sys
+import glob, json, os, sys
 
 timestamp = sys.argv[1]
 out_path = sys.argv[2]
+history_dir = sys.argv[3]
+keep = int(sys.argv[4])
 
 sessions = {}  # name -> {"name", "active_window", "windows": {idx: {...}}}
 for line in sys.stdin.read().splitlines():
@@ -1579,8 +1586,24 @@ for sname in sorted(sessions):
     })
 
 data = {"version": 2, "timestamp": timestamp, "sessions": out_sessions}
-with open(out_path, "w") as f:
-    json.dump(data, f, indent=2)
+
+def write_atomic(path):
+    # Write via temp file so a crash never leaves a truncated snapshot
+    tmp = f"{path}.tmp-{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+# Compact UTC stamp keeps lexical order equal to chronological order
+stamp = timestamp.replace("-", "").replace(":", "")
+history_path = os.path.join(history_dir, f"sessions-{stamp}.json")
+write_atomic(history_path)
+write_atomic(out_path)
+
+# Prune oldest history snapshots beyond the retention count
+history = sorted(glob.glob(os.path.join(history_dir, "sessions-*.json")))
+for old in history[:-keep]:
+    os.remove(old)
 
 n_sess = len(out_sessions)
 n_win  = sum(len(s["windows"]) for s in out_sessions)
@@ -1590,34 +1613,68 @@ PY
 )
 
   local summary n_sess n_win n_pane
-  summary=$(printf '%s' "$tsv" | python3 -c "$py_save" "$timestamp" "$SNAPSHOT_FILE")
+  summary=$(printf '%s' "$tsv" | python3 -c "$py_save" "$timestamp" "$SNAPSHOT_FILE" "$SNAPSHOT_HISTORY_DIR" "$SNAPSHOT_KEEP")
   IFS=$'\t' read -r n_sess n_win n_pane <<<"$summary"
 
   echo -e "${C_GREEN}✓${C_RESET} Saved ${C_BOLD}${n_sess:-0}${C_RESET} sessions · ${C_BOLD}${n_win:-0}${C_RESET} windows · ${C_BOLD}${n_pane:-0}${C_RESET} panes → ${C_DIM}${SNAPSHOT_FILE}${C_RESET}"
+}
+
+# Resolve a snapshot reference to a file path.
+# Accepts an empty value (latest), a path, a history file name,
+# or a bare stamp such as 20261012T033000Z.
+_resolve_snapshot() {
+  local ref="${1:-}"
+  local candidate
+  if [[ -z "$ref" ]]; then
+    candidate="$SNAPSHOT_FILE"
+  elif [[ -f "$ref" ]]; then
+    candidate="$ref"
+  elif [[ -f "${SNAPSHOT_HISTORY_DIR}/${ref}" ]]; then
+    candidate="${SNAPSHOT_HISTORY_DIR}/${ref}"
+  elif [[ -f "${SNAPSHOT_HISTORY_DIR}/sessions-${ref}.json" ]]; then
+    candidate="${SNAPSHOT_HISTORY_DIR}/sessions-${ref}.json"
+  else
+    echo -e "${C_RED}✗ Snapshot not found: ${ref:-$SNAPSHOT_FILE}${C_RESET}" >&2
+    echo -e "${C_DIM}  Run 'tm snapshots --list' to see available snapshots${C_RESET}" >&2
+    return 1
+  fi
+  if [[ ! -f "$candidate" ]]; then
+    echo -e "${C_RED}✗ No snapshot found at ${candidate}${C_RESET}" >&2
+    echo -e "${C_DIM}  Run 'tm save' first${C_RESET}" >&2
+    return 1
+  fi
+  printf '%s\n' "$candidate"
 }
 
 # Restore sessions from snapshot (full session/window/pane tree)
 _cmd_restore() {
   local start_claude=false
   local start_codex=false
-  local option
-  for option in "$@"; do
-    case "$option" in
+  local from=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
       --claude) start_claude=true ;;
       --codex)  start_codex=true ;;
+      --from)
+        if [[ -z "${2:-}" ]]; then
+          echo -e "${C_RED}✗ --from requires a snapshot name${C_RESET}" >&2
+          return 1
+        fi
+        from="$2"
+        shift
+        ;;
+      --from=*) from="${1#--from=}" ;;
       *)
-        echo -e "${C_RED}✗ Unknown restore option: ${option}${C_RESET}" >&2
-        echo -e "${C_DIM}  Usage: tm restore [--claude] [--codex]${C_RESET}" >&2
+        echo -e "${C_RED}✗ Unknown restore option: ${1}${C_RESET}" >&2
+        echo -e "${C_DIM}  Usage: tm restore [--claude] [--codex] [--from <snapshot>]${C_RESET}" >&2
         return 1
         ;;
     esac
+    shift
   done
 
-  if [[ ! -f "$SNAPSHOT_FILE" ]]; then
-    echo -e "${C_RED}✗ No snapshot found at ${SNAPSHOT_FILE}${C_RESET}" >&2
-    echo -e "${C_DIM}  Run 'tm save' first${C_RESET}" >&2
-    exit 1
-  fi
+  local snapshot
+  snapshot=$(_resolve_snapshot "$from") || exit 1
 
   _check_cmd python3
 
@@ -1806,7 +1863,7 @@ PY
 )
 
   local out summary n_sess n_win n_pane n_skip n_claude n_codex
-  out=$(python3 -c "$py_restore" "$SNAPSHOT_FILE" "$start_claude" "$start_codex" "$existing")
+  out=$(python3 -c "$py_restore" "$snapshot" "$start_claude" "$start_codex" "$existing")
   local rc=$?
   if [[ $rc -ne 0 ]]; then
     echo "$out"
@@ -1829,12 +1886,53 @@ PY
   fi
 }
 
-# List latest snapshot contents (sessions → windows → panes)
+# List snapshot history, newest first
+_list_snapshot_history() {
+  _check_cmd python3
+  local py_list
+  py_list=$(cat <<'PY'
+import glob, json, os, sys
+
+history_dir = sys.argv[1]
+keep = sys.argv[2]
+files = sorted(glob.glob(os.path.join(history_dir, "sessions-*.json")), reverse=True)
+if not files:
+    print("No snapshot history. Run 'tm save' to create one.")
+    sys.exit(0)
+
+print(f"Snapshot history ({len(files)} kept, limit {keep}) in {history_dir}")
+for path in files:
+    name = os.path.basename(path)
+    try:
+        d = json.load(open(path))
+        sessions = d.get("sessions", [])
+        n_win = sum(len(s.get("windows", [])) for s in sessions)
+        n_pane = sum(len(w.get("panes", [])) for s in sessions for w in s.get("windows", []))
+        detail = f"{d.get('timestamp', '?')}  {len(sessions)} sessions · {n_win} windows · {n_pane} panes"
+    except Exception as e:
+        detail = f"unreadable ({e})"
+    print(f"  {name:<34} {detail}")
+PY
+)
+  python3 -c "$py_list" "$SNAPSHOT_HISTORY_DIR" "$SNAPSHOT_KEEP"
+}
+
+# Show snapshot contents (sessions → windows → panes); latest by default
 _cmd_snapshots() {
-  if [[ ! -f "$SNAPSHOT_FILE" ]]; then
+  case "${1:-}" in
+    -l|--list)
+      _list_snapshot_history
+      return
+      ;;
+  esac
+
+  if [[ -z "${1:-}" && ! -f "$SNAPSHOT_FILE" ]]; then
     echo -e "${C_DIM}No snapshot found. Run 'tm save' to create one.${C_RESET}"
     return
   fi
+
+  local snapshot
+  snapshot=$(_resolve_snapshot "${1:-}") || exit 1
 
   _check_cmd python3
 
@@ -1888,7 +1986,7 @@ for s in sessions:
             print(f"  {w_cont}   {p_branch} pane {p['index']}  claude={claude:<14} codex={codex:<11} {short(p.get('path',''))}")
 PY
 )
-  python3 -c "$py_show" "$SNAPSHOT_FILE"
+  python3 -c "$py_show" "$snapshot"
 }
 
 # ─── 12. Self-routing ─────────────────────────────────
@@ -1922,7 +2020,7 @@ case "${1:-}" in
   save)            _check_cmd tmux; _cmd_save ;;
   restore)         _check_cmd tmux; _cmd_restore "${@:2}" ;;
   install-claude-hook) _cmd_install_claude_hook ;;
-  snapshots|snaps) _cmd_snapshots ;;
+  snapshots|snaps) _cmd_snapshots "${2:-}" ;;
   help|--help|-h)  _cmd_help ;;
   --version|-v)    echo "tm v${VERSION}" ;;
 

@@ -174,6 +174,7 @@ tm restore                  # 從快照還原 session
 tm restore --claude         # 還原 session 並自動啟動 Claude Code
 tm restore --codex          # 還原 session 並續接 Codex
 tm snapshots                # 顯示最新快照內容
+tm snapshots --list         # 列出帶時間戳的快照歷史
 tm help                     # 說明
 ```
 
@@ -216,6 +217,7 @@ cp completions/tm.zsh ~/.zsh/completions/_tm
 | 變數                | 預設值              | 說明                     |
 |--------------------|---------------------|--------------------------|
 | `TM_PROJECT_BASE`  | tm.sh 上兩層目錄     | 新建 session 時的目錄選單 |
+| `TM_SNAPSHOT_KEEP` | `48`                 | `tm save` 保留的帶時間戳快照份數 |
 
 ---
 
@@ -236,11 +238,14 @@ tm restore --claude      # 還原 session 並自動啟動 Claude Code
 tm restore --codex       # 還原 session 並續接 Codex
 tm restore --claude --codex  # 同時還原兩種 agent
 tm snapshots             # 預覽最新快照
+tm snapshots --list      # 列出快照歷史（新到舊）
+tm snapshots 20261012T033000Z         # 預覽指定的歷史快照
+tm restore --from 20261012T033000Z    # 從指定的歷史快照還原
 ```
 
 Codex ID 會直接從執行中的 pane 偵測。若無法取得精確 ID，還原時會退回 Claude 的 `--continue` 或 Codex 依工作目錄選取的 `--last` 行為。
 
-快照儲存於 `<tm-dir>/snapshots/sessions.json`（與 `tm.sh` 同層目錄），前一版會輪替為 `sessions.json.bak`。備份資料存在專案目錄內，不會覆蓋使用者既有的備份。
+最新快照儲存於 `<tm-dir>/snapshots/sessions.json`（與 `tm.sh` 同層目錄），每次儲存也會另寫一份帶時間戳的副本到 `snapshots/history/sessions-<YYYYMMDDTHHMMSSZ>.json`（UTC）。`tm save` 保留最新 48 份歷史快照（以 30 分鐘間隔約為一天），更舊的會自動刪除；可用 `TM_SNAPSHOT_KEEP` 調整份數。`--from` 可接時間戳、歷史檔名或檔案路徑。備份資料存在專案目錄內，不會覆蓋使用者既有的備份。
 
 ### Cron 自動備份
 
@@ -291,7 +296,7 @@ session-manager/
 │   └── tm.zsh                         # Zsh 補全
 ├── snapshots/                         # 備份快照（gitignored）
 │   ├── sessions.json                  # 最新快照
-│   └── sessions.json.bak             # 前一份快照
+│   └── history/                       # 帶時間戳的快照（保留最新 48 份）
 └── ~/.tmux-manager/                   # 執行時資料（自動建立）
     ├── protected.txt                  # 受保護的 session 名單
     ├── last_session                   # 上一個 session 記錄

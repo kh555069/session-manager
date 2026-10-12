@@ -173,6 +173,7 @@ tm restore                  # Restore sessions from snapshot
 tm restore --claude         # Restore sessions and auto-launch Claude Code
 tm restore --codex          # Restore sessions and resume Codex
 tm snapshots                # Show latest snapshot contents
+tm snapshots --list         # List timestamped snapshot history
 tm help                     # Show help
 ```
 
@@ -215,6 +216,7 @@ Three layers of protection to prevent accidental session termination:
 | Variable           | Default                    | Description                          |
 |--------------------|----------------------------|--------------------------------------|
 | `TM_PROJECT_BASE`  | Two levels above tm.sh     | Directory menu for creating new sessions |
+| `TM_SNAPSHOT_KEEP` | `48`                       | Number of timestamped snapshots kept by `tm save` |
 
 ---
 
@@ -235,11 +237,14 @@ tm restore --claude      # Also auto-launch Claude Code where it was running
 tm restore --codex       # Also resume Codex where it was running
 tm restore --claude --codex  # Restore both agents
 tm snapshots             # Preview the latest snapshot
+tm snapshots --list      # List snapshot history (newest first)
+tm snapshots 20261012T033000Z         # Preview a history snapshot
+tm restore --from 20261012T033000Z    # Restore from a history snapshot
 ```
 
 Codex IDs are detected directly from the running pane. If an exact ID is unavailable, restore falls back to Claude's `--continue` behavior or Codex's directory-scoped `--last` behavior.
 
-Snapshot is saved to `<tm-dir>/snapshots/sessions.json` (next to `tm.sh`), with the previous version rotated to `sessions.json.bak`. This keeps backup data inside the project directory and avoids overwriting any existing user backups.
+The latest snapshot is saved to `<tm-dir>/snapshots/sessions.json` (next to `tm.sh`), and each save also writes a timestamped copy to `snapshots/history/sessions-<YYYYMMDDTHHMMSSZ>.json` (UTC). `tm save` keeps the newest 48 history snapshots (about one day at a 30-minute interval) and deletes older ones; set `TM_SNAPSHOT_KEEP` to change the limit. `--from` accepts the stamp, the history file name, or a file path. This keeps backup data inside the project directory and avoids overwriting any existing user backups.
 
 ### Auto-save via Cron
 
@@ -290,7 +295,7 @@ session-manager/
 │   └── tm.zsh                         # Zsh completion
 ├── snapshots/                         # Backup snapshots (gitignored)
 │   ├── sessions.json                  # Latest snapshot
-│   └── sessions.json.bak             # Previous snapshot
+│   └── history/                       # Timestamped snapshots (newest 48 kept)
 └── ~/.tmux-manager/                   # Runtime data (auto-created)
     ├── protected.txt                  # Protected session list
     ├── last_session                   # Last session record
