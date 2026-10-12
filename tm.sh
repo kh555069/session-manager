@@ -912,7 +912,7 @@ ${C_BOLD}Usage:${C_RESET}
   tm install-claude-hook  Install exact Claude session ID tracking
   tm snapshots [<snapshot>]  Show snapshot contents (latest by default)
   tm snapshots --list   List timestamped snapshot history
-  tm screens [<session>] [--from <snapshot>]
+  tm screens [<session>] [--pane <window>.<pane>] [--from <snapshot>]
                         Show pane screens captured at save time (latest by default)
   tm help               Show this help
 
@@ -1475,24 +1475,20 @@ _session_has_claude() {
   return 1
 }
 
-# Map a session name to its screen capture file name ('/' is not filename-safe)
-_screen_file_name() {
-  printf '%s.ans\n' "${1//\//_}"
+# Map a session name to its screens subdirectory ('/' is not filename-safe).
+# Must match screen_dir_name() in _cmd_screens.
+_screen_dir_name() {
+  printf '%s\n' "${1//\//_}"
 }
 
-# Print one pane's visible screen (with ANSI colors) under a header line
+# Save one pane's visible screen (with ANSI colors) as <win>.<pane>.ans.
+# Headers are not stored: _cmd_screens builds them from the snapshot JSON,
+# so pane boundaries never depend on what the screen happens to show.
 _capture_pane_screen() {
-  local pane_id="$1" session="$2" win_idx="$3" win_name="$4"
-  local pane_idx="$5" pane_active="$6" pane_path="$7"
-  local active_tag=""
-  [[ "$pane_active" == "1" ]] && active_tag=" (active)"
-  printf '%s═══ %s · window %s [%s] · pane %s%s · %s ═══%s\n' \
-    "${C_BOLD}${C_CYAN}" "$session" "$win_idx" "$win_name" "$pane_idx" "$active_tag" \
-    "${pane_path/#$HOME/~}" "$C_RESET"
+  local pane_id="$1" out_file="$2"
   # -e keeps colors; without -S only the visible screen is captured
-  tmux capture-pane -p -e -t "$pane_id" 2>/dev/null || echo "(capture failed)"
-  # Reset attributes so a pane's trailing color never bleeds into the next
-  printf '%s\n' "$C_RESET"
+  tmux capture-pane -p -e -t "$pane_id" >"$out_file" 2>/dev/null \
+    || echo "(capture failed)" >"$out_file"
 }
 
 # Save snapshot of all tmux sessions, windows, panes & layouts
@@ -1527,6 +1523,7 @@ _cmd_save() {
   local session win_line win_idx win_name win_active win_layout
   local pane_line pane_idx pane_active pane_path pane_pid pane_id
   local has_claude claude_mode claude_session_id has_codex codex_session_id
+  local session_screens
 
   while IFS= read -r session; do
     [[ -z "$session" ]] && continue
@@ -1557,8 +1554,9 @@ _cmd_save() {
           codex_session_id=""
         fi
         tsv+="${session}"$'\t'"${win_idx}"$'\t'"${win_name}"$'\t'"${win_active}"$'\t'"${win_layout}"$'\t'"${pane_idx}"$'\t'"${pane_active}"$'\t'"${pane_path}"$'\t'"${has_claude}"$'\t'"${claude_mode}"$'\t'"${claude_session_id}"$'\t'"${has_codex}"$'\t'"${codex_session_id}"$'\n'
-        _capture_pane_screen "$pane_id" "$session" "$win_idx" "$win_name" "$pane_idx" "$pane_active" "$pane_path" \
-          >>"${screens_dir}/$(_screen_file_name "$session")"
+        session_screens="${screens_dir}/$(_screen_dir_name "$session")"
+        mkdir -p "$session_screens"
+        _capture_pane_screen "$pane_id" "${session_screens}/${win_idx}.${pane_idx}.ans"
       done < <(tmux list-panes -t "${session}:${win_idx}" -F '#{pane_index}	#{?pane_active,1,0}	#{pane_current_path}	#{pane_pid}	#{pane_id}' 2>/dev/null)
     done < <(tmux list-windows -t "$session" -F '#{window_index}	#{window_name}	#{?window_active,1,0}	#{window_layout}' 2>/dev/null)
   done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
@@ -2030,21 +2028,22 @@ PY
 
 # Show pane screens captured with a snapshot: list sessions, or print one
 _cmd_screens() {
-  local session="" from=""
+  local session="" from="" pane=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --from)
+      --from|--pane)
         if [[ -z "${2:-}" ]]; then
-          echo -e "${C_RED}✗ --from requires a snapshot name${C_RESET}" >&2
+          echo -e "${C_RED}✗ ${1} requires a value${C_RESET}" >&2
           return 1
         fi
-        from="$2"
+        if [[ "$1" == "--from" ]]; then from="$2"; else pane="$2"; fi
         shift
         ;;
       --from=*) from="${1#--from=}" ;;
+      --pane=*) pane="${1#--pane=}" ;;
       -*)
         echo -e "${C_RED}✗ Unknown screens option: ${1}${C_RESET}" >&2
-        echo -e "${C_DIM}  Usage: tm screens [<session>] [--from <snapshot>]${C_RESET}" >&2
+        echo -e "${C_DIM}  Usage: tm screens [<session>] [--pane <window>.<pane>] [--from <snapshot>]${C_RESET}" >&2
         return 1
         ;;
       *) session="$1" ;;
@@ -2052,40 +2051,102 @@ _cmd_screens() {
     shift
   done
 
+  if [[ -n "$pane" && ! "$pane" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    echo -e "${C_RED}✗ --pane must look like <window>.<pane>, e.g. 0.1 (got: ${pane})${C_RESET}" >&2
+    return 1
+  fi
+  if [[ -n "$pane" && -z "$session" ]]; then
+    echo -e "${C_RED}✗ --pane requires a session name${C_RESET}" >&2
+    return 1
+  fi
+
   _check_cmd python3
-  local snapshot stamp
+  local snapshot
   snapshot=$(_resolve_snapshot "$from") || exit 1
-  # The JSON timestamp identifies the matching screens dir for any snapshot path
-  stamp=$(python3 -c '
-import json, sys
-print(json.load(open(sys.argv[1])).get("timestamp", "").replace("-", "").replace(":", ""))
-' "$snapshot") || exit 1
 
-  local screens_dir="${SNAPSHOT_HISTORY_DIR}/screens-${stamp}"
-  if [[ -z "$stamp" || ! -d "$screens_dir" ]]; then
-    echo -e "${C_RED}✗ No screens captured for snapshot ${stamp:-?}${C_RESET}" >&2
-    echo -e "${C_DIM}  Screens are captured by 'tm save' from this version on${C_RESET}" >&2
-    exit 1
-  fi
+  # Pane list, counts and headers all come from the snapshot JSON; screen
+  # files hold raw captures only, so their contents never affect boundaries.
+  local py_screens
+  py_screens=$(cat <<'PY'
+import json, os, sys
 
-  if [[ -z "$session" ]]; then
-    echo -e "${C_BOLD}Screens for snapshot ${stamp}${C_RESET}  ${C_DIM}(tm screens <session> to view)${C_RESET}"
-    local f name panes
-    for f in "$screens_dir"/*.ans; do
-      [[ -f "$f" ]] || continue
-      name="${f##*/}"
-      panes=$(grep -c '═══ ' "$f")
-      printf '  %-36s %s panes\n' "${name%.ans}" "$panes"
-    done
-    return
-  fi
+snapshot, history_dir, session, pane = sys.argv[1:5]
+B, C, D, R, X = "\033[1m", "\033[0;36m", "\033[2m", "\033[0;31m", "\033[0m"
 
-  local file="${screens_dir}/$(_screen_file_name "$session")"
-  if [[ ! -f "$file" ]]; then
-    echo -e "${C_RED}✗ No screens for session '${session}' in snapshot ${stamp}${C_RESET}" >&2
-    exit 1
-  fi
-  cat "$file"
+def fail(msg):
+    print(f"{R}✗ {msg}{X}", file=sys.stderr)
+    sys.exit(1)
+
+def screen_dir_name(name):
+    # Must match _screen_dir_name in tm.sh
+    return name.replace("/", "_")
+
+data = json.load(open(snapshot))
+stamp = data.get("timestamp", "").replace("-", "").replace(":", "")
+screens_dir = os.path.join(history_dir, f"screens-{stamp}")
+if not stamp or not os.path.isdir(screens_dir):
+    fail(f"No screens captured for snapshot {stamp or '?'}")
+
+sessions = data.get("sessions", [])
+home = os.environ.get("HOME", "")
+out = sys.stdout.buffer
+
+def emit(text):
+    out.write(text.encode())
+
+if not session:
+    emit(f"{B}Screens for snapshot {stamp}{X}  {D}(tm screens <session> to view){X}\n")
+    for s in sessions:
+        panes = [f"{w['index']}.{p['index']}" for w in s.get("windows", []) for p in w.get("panes", [])]
+        sdir = os.path.join(screens_dir, screen_dir_name(s["name"]))
+        has = os.path.isdir(sdir) or os.path.isfile(sdir + ".ans")
+        note = "" if has else f"  {D}(no screens){X}"
+        emit(f"  {s['name']:<36} {len(panes)} panes: {' '.join(panes)}{note}\n")
+    sys.exit(0)
+
+match = next((s for s in sessions if s["name"] == session), None)
+if match is None:
+    fail(f"Session '{session}' not in snapshot {stamp}")
+
+sdir = os.path.join(screens_dir, screen_dir_name(session))
+legacy = sdir + ".ans"
+if not os.path.isdir(sdir):
+    # Early captures stored one file per session with inline headers
+    if os.path.isfile(legacy):
+        if pane:
+            fail(f"Snapshot {stamp} uses the old one-file format; --pane needs a newer save")
+        out.write(open(legacy, "rb").read())
+        sys.exit(0)
+    fail(f"No screens for session '{session}' in snapshot {stamp}")
+
+shown = 0
+for w in match.get("windows", []):
+    for p in w.get("panes", []):
+        key = f"{w['index']}.{p['index']}"
+        if pane and key != pane:
+            continue
+        path = p.get("path", "")
+        if home and path.startswith(home):
+            path = "~" + path[len(home):]
+        active = " (active)" if w.get("active_pane") == p["index"] else ""
+        if shown:
+            emit("\n")
+        emit(f"{B}{C}═══ {session} · window {w['index']} [{w.get('name', '')}] · pane {key}{active} · {path} ═══{X}\n")
+        f = os.path.join(sdir, f"{key}.ans")
+        if os.path.isfile(f):
+            out.write(open(f, "rb").read())
+        else:
+            emit(f"{D}(no screen captured){X}\n")
+        # Reset so a pane's trailing color never bleeds into the next header
+        emit(X)
+        shown += 1
+
+if not shown:
+    fail(f"Pane {pane} not in session '{session}' (run 'tm screens' to list panes)")
+emit("\n")
+PY
+)
+  python3 -c "$py_screens" "$snapshot" "$SNAPSHOT_HISTORY_DIR" "$session" "$pane"
 }
 
 # ─── 12. Self-routing ─────────────────────────────────

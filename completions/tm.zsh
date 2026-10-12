@@ -96,6 +96,7 @@ _tm() {
     screens)
       _arguments -s \
         '--from[Use a history snapshot]:snapshot:_tm_snapshots' \
+        '--pane[Show one pane only]:window.pane (e.g. 0.1):' \
         '1:session:_tm_sessions' && ret=0
       ;;
     snapshots|snaps)
