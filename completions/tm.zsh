@@ -46,10 +46,11 @@ _tm() {
     'protect:Toggle session protection'
     'summarize:Generate AI summary for a session'
     'summarize-all:Generate AI summaries for all sessions'
-    'save:Snapshot all sessions for restore after reboot'
+    'save:Snapshot all sessions and pane screens'
     'restore:Restore sessions from snapshot'
     'install-claude-hook:Install exact Claude session ID tracking'
     'snapshots:Show snapshot contents or history'
+    'screens:Show pane screens captured at save time'
     'help:Show usage information'
   )
 
@@ -91,6 +92,11 @@ _tm() {
         '--claude[Auto-launch Claude Code after restore]' \
         '--codex[Resume Codex after restore]' \
         '--from[Restore from a history snapshot]:snapshot:_tm_snapshots' && ret=0
+      ;;
+    screens)
+      _arguments -s \
+        '--from[Use a history snapshot]:snapshot:_tm_snapshots' \
+        '1:session:_tm_sessions' && ret=0
       ;;
     snapshots|snaps)
       _alternative \

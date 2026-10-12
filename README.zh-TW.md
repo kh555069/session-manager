@@ -175,6 +175,7 @@ tm restore --claude         # 還原 session 並自動啟動 Claude Code
 tm restore --codex          # 還原 session 並續接 Codex
 tm snapshots                # 顯示最新快照內容
 tm snapshots --list         # 列出帶時間戳的快照歷史
+tm screens myapp            # 顯示上次備份時擷取的 pane 畫面
 tm help                     # 說明
 ```
 
@@ -241,11 +242,16 @@ tm snapshots             # 預覽最新快照
 tm snapshots --list      # 列出快照歷史（新到舊）
 tm snapshots 20261012T033000Z         # 預覽指定的歷史快照
 tm restore --from 20261012T033000Z    # 從指定的歷史快照還原
+tm screens                            # 列出有擷取畫面的 session
+tm screens myapp                      # 顯示 myapp 上次備份時的畫面
+tm screens myapp --from 20261012T033000Z  # 顯示指定歷史快照的畫面
 ```
 
 Codex ID 會直接從執行中的 pane 偵測。若無法取得精確 ID，還原時會退回 Claude 的 `--continue` 或 Codex 依工作目錄選取的 `--last` 行為。
 
-最新快照儲存於 `<tm-dir>/snapshots/sessions.json`（與 `tm.sh` 同層目錄），每次儲存也會另寫一份帶時間戳的副本到 `snapshots/history/sessions-<YYYYMMDDTHHMMSSZ>.json`（UTC）。`tm save` 保留最新 48 份歷史快照（以 30 分鐘間隔約為一天），更舊的會自動刪除；可用 `TM_SNAPSHOT_KEEP` 調整份數。`--from` 可接時間戳、歷史檔名或檔案路徑。備份資料存在專案目錄內，不會覆蓋使用者既有的備份。
+最新快照儲存於 `<tm-dir>/snapshots/sessions.json`（與 `tm.sh` 同層目錄），每次儲存也會另寫一份帶時間戳的副本到 `snapshots/history/sessions-<YYYYMMDDTHHMMSSZ>.json`（UTC）。`tm save` 保留最新 48 份歷史快照（以 30 分鐘間隔約為一天），更舊的會自動刪除；可用 `TM_SNAPSHOT_KEEP` 調整份數。`--from` 可接時間戳、歷史檔名或檔案路徑。
+
+每次儲存也會擷取每個 pane 的可見畫面（保留 ANSI 顏色，使用 `tmux capture-pane -e`），存到 `snapshots/history/screens-<stamp>/<session>.ans`，每個 session 一個檔案，每個 pane 前有一行標題。用 `tm screens` 即可看到當時各 session 的最後畫面；畫面會和對應快照一起清除。由於 pane 輸出可能含敏感資訊，畫面目錄權限為僅擁有者可讀（`700`）。備份資料存在專案目錄內，不會覆蓋使用者既有的備份。
 
 ### Cron 自動備份
 
@@ -297,6 +303,8 @@ session-manager/
 ├── snapshots/                         # 備份快照（gitignored）
 │   ├── sessions.json                  # 最新快照
 │   └── history/                       # 帶時間戳的快照（保留最新 48 份）
+│       ├── sessions-<stamp>.json      # Session 結構
+│       └── screens-<stamp>/           # Pane 畫面，每個 session 一個 <session>.ans
 └── ~/.tmux-manager/                   # 執行時資料（自動建立）
     ├── protected.txt                  # 受保護的 session 名單
     ├── last_session                   # 上一個 session 記錄

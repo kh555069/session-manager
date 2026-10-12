@@ -174,6 +174,7 @@ tm restore --claude         # Restore sessions and auto-launch Claude Code
 tm restore --codex          # Restore sessions and resume Codex
 tm snapshots                # Show latest snapshot contents
 tm snapshots --list         # List timestamped snapshot history
+tm screens myapp            # Show pane screens captured at the last save
 tm help                     # Show help
 ```
 
@@ -240,11 +241,16 @@ tm snapshots             # Preview the latest snapshot
 tm snapshots --list      # List snapshot history (newest first)
 tm snapshots 20261012T033000Z         # Preview a history snapshot
 tm restore --from 20261012T033000Z    # Restore from a history snapshot
+tm screens                            # List sessions with captured screens
+tm screens myapp                      # Show myapp's screens at the last save
+tm screens myapp --from 20261012T033000Z  # Screens from a history snapshot
 ```
 
 Codex IDs are detected directly from the running pane. If an exact ID is unavailable, restore falls back to Claude's `--continue` behavior or Codex's directory-scoped `--last` behavior.
 
-The latest snapshot is saved to `<tm-dir>/snapshots/sessions.json` (next to `tm.sh`), and each save also writes a timestamped copy to `snapshots/history/sessions-<YYYYMMDDTHHMMSSZ>.json` (UTC). `tm save` keeps the newest 48 history snapshots (about one day at a 30-minute interval) and deletes older ones; set `TM_SNAPSHOT_KEEP` to change the limit. `--from` accepts the stamp, the history file name, or a file path. This keeps backup data inside the project directory and avoids overwriting any existing user backups.
+The latest snapshot is saved to `<tm-dir>/snapshots/sessions.json` (next to `tm.sh`), and each save also writes a timestamped copy to `snapshots/history/sessions-<YYYYMMDDTHHMMSSZ>.json` (UTC). `tm save` keeps the newest 48 history snapshots (about one day at a 30-minute interval) and deletes older ones; set `TM_SNAPSHOT_KEEP` to change the limit. `--from` accepts the stamp, the history file name, or a file path.
+
+Each save also captures the visible screen of every pane (with ANSI colors, via `tmux capture-pane -e`) into `snapshots/history/screens-<stamp>/<session>.ans`, one file per session with a header line per pane. `tm screens` prints them so you can see what each session looked like at that moment; screens are pruned together with their snapshot. The screens directory is owner-only (`700`), since pane output may contain sensitive data. This keeps backup data inside the project directory and avoids overwriting any existing user backups.
 
 ### Auto-save via Cron
 
@@ -296,6 +302,8 @@ session-manager/
 ├── snapshots/                         # Backup snapshots (gitignored)
 │   ├── sessions.json                  # Latest snapshot
 │   └── history/                       # Timestamped snapshots (newest 48 kept)
+│       ├── sessions-<stamp>.json      # Session tree
+│       └── screens-<stamp>/           # Pane screens, one <session>.ans per session
 └── ~/.tmux-manager/                   # Runtime data (auto-created)
     ├── protected.txt                  # Protected session list
     ├── last_session                   # Last session record
