@@ -57,17 +57,27 @@ test_blocked_permission_by_type() {
 }
 
 test_blocked_input_by_type() {
-  hook blocked '{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"Claude is waiting for your input"}'
-  assert_eq input "$(field reason)" idle_prompt
   hook blocked '{"hook_event_name":"Notification","notification_type":"elicitation_dialog","message":"x"}'
+  assert_eq blocked "$(field state)" state
   assert_eq input "$(field reason)" elicitation_dialog
+}
+
+# idle_prompt fires ~60 s after every Stop; the turn is already idle, so it
+# must not flip the pane to blocked
+test_idle_prompt_keeps_idle() {
+  hook idle '{"hook_event_name":"Stop"}'
+  local before; before=$(cat "$STATE_DIR/7.json")
+  hook blocked '{"hook_event_name":"Notification","notification_type":"idle_prompt","message":"Claude is waiting for your input"}'
+  assert_eq "$before" "$(cat "$STATE_DIR/7.json")" unchanged
 }
 
 test_blocked_fallback_by_message() {
   hook blocked '{"hook_event_name":"Notification","message":"Claude needs your permission to use Bash"}'
   assert_eq permission "$(field reason)" permission
+  # Without notification_type the idle reminder is not a block
+  hook idle '{"hook_event_name":"Stop"}'
   hook blocked '{"hook_event_name":"Notification","message":"Claude is waiting for your input"}'
-  assert_eq input "$(field reason)" input
+  assert_eq idle "$(field state)" idle-reminder-ignored
 }
 
 test_ignored_notification_type() {

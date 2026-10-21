@@ -15,7 +15,7 @@ backups() {
 assert_all_events() {
   local pair ev st
   for pair in SessionStart:idle UserPromptSubmit:working PreToolUse:working \
-              Notification:blocked Stop:idle SessionEnd:dead; do
+              PostToolUse:working Notification:blocked Stop:idle SessionEnd:dead; do
     ev=${pair%%:*}; st=${pair##*:}
     assert_eq 1 "$(count_cmd "$ev" "hook-state $st")" "$ev"
   done

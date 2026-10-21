@@ -23,7 +23,7 @@ tm.sh 補上三項能力，讓 Leader Agent 可以用 CLI 管理 Worker，不必
 
 | 狀態 | 意義 | 寫入時機 |
 | --- | --- | --- |
-| `working` | agent 正在處理一輪請求 | `UserPromptSubmit`、`PreToolUse` |
+| `working` | agent 正在處理一輪請求 | `UserPromptSubmit`、`PreToolUse`、`PostToolUse` |
 | `blocked` | 等待人類回應（權限確認或輸入） | `Notification` |
 | `idle` | 一輪結束，等待下一個 prompt | `Stop`、`SessionStart` |
 | `dead` | agent 已結束或 pane 不存在 | `SessionEnd`，或讀取時發現 pane 消失 |
@@ -33,7 +33,9 @@ tm.sh 補上三項能力，讓 Leader Agent 可以用 CLI 管理 Worker，不必
 
 圖中只畫會寫入狀態檔的 4 個狀態；`unknown` 是讀取端在沒有狀態檔時推得的，不參與轉移，所以不在圖中。正常循環是 idle 與 working 之間來回；只有 blocked 需要人或 Leader 介入，任一狀態都可能因 SessionEnd 進入 dead。
 
-`PreToolUse` 也寫 `working`，是為了讓 `blocked` 在使用者核准權限後能回到 `working`；否則要等下一個 `Stop` 才會更新。這個 hook 觸發頻繁，寫入必須夠輕（見下方效能限制）。
+`PreToolUse` 在權限確認**之前**觸發，所以使用者核准後真正把 `blocked` 拉回 `working` 的是 `PostToolUse`；只靠 `PreToolUse` 的話，核准後整段工具執行期間都會停在 `blocked`。使用者拒絕或按 Esc 中斷時沒有 `PostToolUse`，`blocked` 會留到下一個 prompt。這兩個 hook 觸發頻繁，寫入必須夠輕（見下方效能限制）。
+
+`Notification` 只有權限確認（`permission_prompt`）與要求輸入（`elicitation_dialog`）寫 `blocked`。`idle_prompt` 是每次 `Stop` 約 60 秒後的閒置提醒，這時一輪已經結束、狀態已是 `idle`，不寫檔；否則每個做完的 session 都會在一分鐘後變成 `blocked` 並置頂。
 
 ### 狀態檔格式
 
@@ -69,6 +71,7 @@ tm.sh 補上三項能力，讓 Leader Agent 可以用 CLI 管理 Worker，不必
   "SessionStart":     [{ "hooks": [{ "type": "command", "command": "tm hook-state idle" }] }],
   "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "tm hook-state working" }] }],
   "PreToolUse":       [{ "hooks": [{ "type": "command", "command": "tm hook-state working" }] }],
+  "PostToolUse":      [{ "hooks": [{ "type": "command", "command": "tm hook-state working" }] }],
   "Notification":     [{ "hooks": [{ "type": "command", "command": "tm hook-state blocked" }] }],
   "Stop":             [{ "hooks": [{ "type": "command", "command": "tm hook-state idle" }] }],
   "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "tm hook-state dead" }] }]
@@ -337,7 +340,7 @@ Notification 的 `message` 可能含指令內容或路徑，送到外部服務�
 待確認問題：
 
 - [x] `Notification` 是否能區分權限確認與閒置等待輸入？需對照目前使用的 Claude Code 版本的 hook payload 欄位，決定 `reason` 怎麼填。
-  - PR 1 決定：先看 `notification_type`（`permission_prompt` → `permission`；`idle_prompt`、`elicitation_dialog` → `input`；其他類型不寫檔），沒有此欄位時才看 `message` 是否含 `permission`。真機 payload 仍待驗證。
+  - PR 1 決定：先看 `notification_type`（`permission_prompt` → `permission`；`elicitation_dialog` → `input`；`idle_prompt` 等其他類型不寫檔），沒有此欄位時只有 `message` 含 `permission` 才寫 `blocked`。真機 payload 仍待驗證。
 - [x] Hook 內呼叫 `tm`（PATH 上的 symlink）還是絕對路徑？PATH 在 hook 環境中不一定包含 `~/.local/bin`。
   - PR 1 決定：寫入 `tm.sh` 的絕對路徑，與既有 `_record-claude-session` 相同。
 - [x] `PreToolUse` 每次寫檔的實際成本，在密集工具呼叫下是否可接受？先量測再決定是否加短路。

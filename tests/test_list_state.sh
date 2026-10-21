@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 source "$(dirname "$0")/lib.sh"
 
-# set_state <target> <state> [payload]: write a state file via the real hook
+# set_state <target> <state> [payload]: write a state file via the real hook.
+# The default payload is a permission prompt so "blocked" is recorded
+# (other states ignore notification_type).
 set_state() {
-  printf '%s' "${3:-{\}}" | TMUX_PANE="$(pane_id "$1")" "$TM" hook-state "$2"
+  local payload='{"notification_type":"permission_prompt"}'
+  [[ $# -ge 3 ]] && payload="$3"
+  printf '%s' "$payload" | TMUX_PANE="$(pane_id "$1")" "$TM" hook-state "$2"
 }
 
 # line_for <session>: the _list row whose NAME column is exactly the session

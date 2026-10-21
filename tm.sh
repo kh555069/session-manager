@@ -220,9 +220,13 @@ _agent_states() {
   local mode="$1"
   command -v python3 &>/dev/null || return 0
   python3 -I -S -c '
-import calendar, json, os, sys, time
+import calendar, json, os, re, sys, time
 
 mode, state_dir, stale_after = sys.argv[1], sys.argv[2], int(sys.argv[3])
+# Terminal escape sequences (OSC, CSI) and other control characters in file
+# fields must never reach the terminal
+escapes = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]|\x1b.?")
+controls = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 now = time.time()
 rank = {"unknown": 0, "idle": 1, "working": 2, "working?": 3, "blocked": 4}
 
@@ -233,8 +237,8 @@ def epoch(value):
         return None
 
 def clean(value):
-    text = " ".join(str(value).split()) if value else ""
-    return text or "-"
+    text = controls.sub(" ", escapes.sub("", str(value))) if value else ""
+    return " ".join(text.split()) or "-"
 
 order, agg = [], {}
 for line in sys.stdin:
@@ -1463,14 +1467,18 @@ if state == "blocked":
     ntype = payload.get("notification_type")
     if ntype == "permission_prompt":
         reason = "permission"
-    elif ntype in ("idle_prompt", "elicitation_dialog"):
+    elif ntype == "elicitation_dialog":
         reason = "input"
     elif ntype:
-        sys.exit(0)  # e.g. auth_success: not a request for human input
+        # e.g. idle_prompt (sent ~60 s after every Stop, the turn is already
+        # idle) or auth_success: not a request for human input
+        sys.exit(0)
     elif "permission" in str(message or "").lower():
         reason = "permission"
     else:
-        reason = "input"
+        # Payload without notification_type: only a permission request is
+        # recognisable; "waiting for your input" is the idle reminder
+        sys.exit(0)
 
 os.makedirs(state_dir, mode=0o700, exist_ok=True)
 path = os.path.join(state_dir, pane.lstrip("%") + ".json")
@@ -1545,6 +1553,9 @@ wanted = [
     ("SessionStart", "hook-state idle"),
     ("UserPromptSubmit", "hook-state working"),
     ("PreToolUse", "hook-state working"),
+    # PreToolUse fires before the permission prompt, so only PostToolUse
+    # clears blocked once the user has approved
+    ("PostToolUse", "hook-state working"),
     ("Notification", "hook-state blocked"),
     ("Stop", "hook-state idle"),
     ("SessionEnd", "hook-state dead"),

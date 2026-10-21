@@ -22,9 +22,19 @@ test_preview_hides_section_without_state() {
 
 test_preview_message_single_line() {
   new_session a
-  set_state a blocked '{"notification_type":"idle_prompt","message":"line1\nline2\tx"}'
+  set_state a blocked '{"notification_type":"permission_prompt","message":"line1\nline2\tx"}'
   local out; out=$("$TM" _preview a)
   assert_contains "$out" "line1 line2 x" joined
+}
+
+test_preview_strips_control_chars() {
+  new_session a
+  set_state a blocked '{"notification_type":"permission_prompt","message":"\u001b]0;pwned\u0007\u001b[31mred\u001b[0m text"}'
+  local out; out=$("$TM" _preview a)
+  assert_contains "$out" "red" text-kept
+  assert_not_contains "$out" "pwned"$'\a' bell
+  assert_not_contains "$out" $'\e]0;' osc
+  assert_not_contains "$out" $'\e[31m' sgr
 }
 
 test_save_removes_orphan_state() {
