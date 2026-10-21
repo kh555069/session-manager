@@ -31,7 +31,7 @@ tm.sh 補上三項能力，讓 Leader Agent 可以用 CLI 管理 Worker，不必
 
 &#91;embedded content: agent 狀態轉移 · 4 個狀態\]
 
-正常循環是 idle 與 working 之間來回；只有 blocked 需要人或 Leader 介入，任一狀態都可能因 SessionEnd 進入 dead。
+圖中只畫會寫入狀態檔的 4 個狀態；`unknown` 是讀取端在沒有狀態檔時推得的，不參與轉移，所以不在圖中。正常循環是 idle 與 working 之間來回；只有 blocked 需要人或 Leader 介入，任一狀態都可能因 SessionEnd 進入 dead。
 
 `PreToolUse` 也寫 `working`，是為了讓 `blocked` 在使用者核准權限後能回到 `working`；否則要等下一個 `Stop` 才會更新。這個 hook 觸發頻繁，寫入必須夠輕（見下方效能限制）。
 
@@ -327,13 +327,12 @@ Notification 的 `message` 可能含指令內容或路徑，送到外部服務�
 
 ## 實作順序與待確認問題
 
-依相依順序分三個 PR，每個都能獨立合併、獨立使用。
+依相依順序分四個 PR，每個都能獨立合併、獨立使用。
 
 - [ ] **PR 1 狀態檔**：`tm hook-state`、擴充 `install-claude-hook`、fzf 的 `ST` 欄與 blocked 置頂、`tm save` 清理孤兒狀態檔
 - [ ] **PR 2 機器介面**：`tm ls --json` 與篩選參數、exit code 約定、zsh completion 補上新參數
 - [ ] **PR 3 等待原語**：`tm wait` 含 `--after-change` 與 inotify 模式，README 補上 Leader 使用範例
-
-* [ ] **PR 4 總覽與通知**：`tm dash`、`tm state-count`、`TM_NOTIFY_CMD` 推播，README 補上 tmux 綁定與 Telegram 範例
+- [ ] **PR 4 總覽與通知**：`tm dash`、`tm state-count`、`TM_NOTIFY_CMD` 推播，README 補上 tmux 綁定與 Telegram 範例
 
 待確認問題：
 
