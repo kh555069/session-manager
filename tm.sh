@@ -1362,7 +1362,8 @@ os.replace(tmp, path)
   return 0
 }
 
-# Safely merge tm's SessionStart recorder into the user's Claude settings.
+# Safely merge tm's session recorder and agent state hooks into the user's
+# Claude settings. Only missing entries are added; user hooks are kept.
 _cmd_install_claude_hook() {
   _check_cmd python3
   mkdir -p "${CLAUDE_SETTINGS%/*}"
@@ -1371,7 +1372,6 @@ _cmd_install_claude_hook() {
 import datetime, json, os, shlex, shutil, sys, uuid
 
 settings_path, script_path = sys.argv[1:]
-command = f"{shlex.quote(script_path)} _record-claude-session"
 existed = os.path.isfile(settings_path)
 
 if existed:
@@ -1393,25 +1393,43 @@ if not isinstance(hooks, dict):
     print("Failed to update Claude settings: hooks must be an object", file=sys.stderr)
     sys.exit(1)
 
-session_start = hooks.setdefault("SessionStart", [])
-if not isinstance(session_start, list):
-    print("Failed to update Claude settings: hooks.SessionStart must be an array", file=sys.stderr)
-    sys.exit(1)
+quoted = shlex.quote(script_path)
+wanted = [
+    ("SessionStart", "_record-claude-session"),
+    ("SessionStart", "hook-state idle"),
+    ("UserPromptSubmit", "hook-state working"),
+    ("PreToolUse", "hook-state working"),
+    ("Notification", "hook-state blocked"),
+    ("Stop", "hook-state idle"),
+    ("SessionEnd", "hook-state dead"),
+]
 
-for group in session_start:
-    if not isinstance(group, dict):
+# Validate every event first so a malformed file is never partially changed
+for event in dict.fromkeys(e for e, _ in wanted):
+    if not isinstance(hooks.get(event, []), list):
+        print(f"Failed to update Claude settings: hooks.{event} must be an array", file=sys.stderr)
+        sys.exit(1)
+
+def installed(groups, suffix):
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for hook in group.get("hooks", []):
+            if isinstance(hook, dict) and str(hook.get("command", "")).endswith(suffix):
+                return True
+    return False
+
+added = []
+for event, suffix in wanted:
+    groups = hooks.setdefault(event, [])
+    if installed(groups, suffix):
         continue
-    for hook in group.get("hooks", []):
-        if isinstance(hook, dict) and "_record-claude-session" in hook.get("command", ""):
-            print("Claude SessionStart hook is already installed")
-            sys.exit(0)
+    groups.append({"hooks": [{"type": "command", "command": f"{quoted} {suffix}"}]})
+    added.append(f"{event} ({suffix})")
 
-session_start.append({
-    "hooks": [{
-        "type": "command",
-        "command": command,
-    }],
-})
+if not added:
+    print("Claude hooks are already installed")
+    sys.exit(0)
 
 backup_path = ""
 if existed:
@@ -1426,7 +1444,9 @@ with open(temp_path, "x") as settings_file:
 os.chmod(temp_path, os.stat(settings_path).st_mode & 0o777 if existed else 0o600)
 os.replace(temp_path, settings_path)
 
-print(f"Installed Claude SessionStart hook in {settings_path}")
+print(f"Installed Claude hooks in {settings_path}:")
+for item in added:
+    print(f"  {item}")
 if backup_path:
     print(f"Backup: {backup_path}")
 ' "$CLAUDE_SETTINGS" "$SELF"
