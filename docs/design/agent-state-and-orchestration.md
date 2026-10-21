@@ -329,15 +329,18 @@ Notification 的 `message` 可能含指令內容或路徑，送到外部服務�
 
 依相依順序分四個 PR，每個都能獨立合併、獨立使用。
 
-- [ ] **PR 1 狀態檔**：`tm hook-state`、擴充 `install-claude-hook`、fzf 的 `ST` 欄與 blocked 置頂、`tm save` 清理孤兒狀態檔
+- [x] **PR 1 狀態檔**：`tm hook-state`、擴充 `install-claude-hook`、fzf 的 `ST` 欄與 blocked 置頂、`tm save` 清理孤兒狀態檔
 - [ ] **PR 2 機器介面**：`tm ls --json` 與篩選參數、exit code 約定、zsh completion 補上新參數
 - [ ] **PR 3 等待原語**：`tm wait` 含 `--after-change` 與 inotify 模式，README 補上 Leader 使用範例
 - [ ] **PR 4 總覽與通知**：`tm dash`、`tm state-count`、`TM_NOTIFY_CMD` 推播，README 補上 tmux 綁定與 Telegram 範例
 
 待確認問題：
 
-- [ ] `Notification` 是否能區分權限確認與閒置等待輸入？需對照目前使用的 Claude Code 版本的 hook payload 欄位，決定 `reason` 怎麼填。
-- [ ] Hook 內呼叫 `tm`（PATH 上的 symlink）還是絕對路徑？PATH 在 hook 環境中不一定包含 `~/.local/bin`。
-- [ ] `PreToolUse` 每次寫檔的實際成本，在密集工具呼叫下是否可接受？先量測再決定是否加短路。
+- [x] `Notification` 是否能區分權限確認與閒置等待輸入？需對照目前使用的 Claude Code 版本的 hook payload 欄位，決定 `reason` 怎麼填。
+  - PR 1 決定：先看 `notification_type`（`permission_prompt` → `permission`；`idle_prompt`、`elicitation_dialog` → `input`；其他類型不寫檔），沒有此欄位時才看 `message` 是否含 `permission`。真機 payload 仍待驗證。
+- [x] Hook 內呼叫 `tm`（PATH 上的 symlink）還是絕對路徑？PATH 在 hook 環境中不一定包含 `~/.local/bin`。
+  - PR 1 決定：寫入 `tm.sh` 的絕對路徑，與既有 `_record-claude-session` 相同。
+- [x] `PreToolUse` 每次寫檔的實際成本，在密集工具呼叫下是否可接受？先量測再決定是否加短路。
+  - 量測（macOS，20–40 次平均）：預設 `python3` 為 54.3 ms；改用 `python3 -I -S` 並移除 `tempfile` 後為 39.4 ms，低於 50 ms，不需要短路。
 - [ ] Subagent（Task tool）的事件是否會覆寫主 agent 的狀態？可能需要忽略 `SubagentStop`，或依 `session_id` 區分。
 - [ ] Codex 的 `working` 與 `blocked` 是否有更可靠的訊號，可以取代畫面比對？
