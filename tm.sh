@@ -34,6 +34,7 @@ readonly SELF="$_self"
 readonly CONFIG_DIR="${HOME}/.tmux-manager"
 readonly PROTECTED_FILE="${CONFIG_DIR}/protected.txt"
 readonly CLAUDE_SESSION_MAP="${CONFIG_DIR}/claude_sessions.jsonl"
+readonly STATE_DIR="${CONFIG_DIR}/state"
 readonly CLAUDE_PROJECTS="${HOME}/.claude/projects"
 readonly CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
 readonly SCRIPT_DIR="${SELF%/*}"
@@ -909,7 +910,7 @@ ${C_BOLD}Usage:${C_RESET}
   tm save               Snapshot all sessions, windows, panes, layouts & screens
   tm restore [--claude] [--codex] [--from <snapshot>]
                         Restore full session tree and optionally relaunch agents
-  tm install-claude-hook  Install exact Claude session ID tracking
+  tm install-claude-hook  Install Claude session ID and agent state hooks
   tm snapshots [<snapshot>]  Show snapshot contents (latest by default)
   tm snapshots --list   List timestamped snapshot history
   tm screens [<session>] [--pane <window>.<pane>] [--from <snapshot>]
@@ -1280,6 +1281,85 @@ except (KeyError, TypeError, ValueError, json.JSONDecodeError):
     fi
     printf '%s\n' "$record" >> "$CLAUDE_SESSION_MAP"
   fi
+}
+
+# Record an agent's state for the current pane (called by Claude Code hooks).
+# Never fails the hook: runtime errors are swallowed and exit 0, because a
+# non-zero hook exit can block the agent. Only a bad state argument exits 3.
+_cmd_hook_state() {
+  local state="${1:-}"
+  case "$state" in
+    working|blocked|idle|dead) ;;
+    *)
+      echo "Usage: tm hook-state <working|blocked|idle|dead>" >&2
+      exit 3
+      ;;
+  esac
+  [[ -n "${TMUX_PANE:-}" ]] || return 0
+  command -v python3 &>/dev/null || return 0
+
+  # -I -S and no tempfile import keep interpreter startup inside the hook's
+  # 50 ms budget (PreToolUse fires on every tool call)
+  python3 -I -S -c '
+import json, os, sys, time
+
+state, pane, state_dir = sys.argv[1:]
+try:
+    payload = json.loads(sys.stdin.read() or "null")
+except ValueError:
+    payload = None
+if not isinstance(payload, dict):
+    payload = {}
+
+reason = message = None
+if state == "blocked":
+    message = payload.get("message")
+    ntype = payload.get("notification_type")
+    if ntype == "permission_prompt":
+        reason = "permission"
+    elif ntype in ("idle_prompt", "elicitation_dialog"):
+        reason = "input"
+    elif ntype:
+        sys.exit(0)  # e.g. auth_success: not a request for human input
+    elif "permission" in str(message or "").lower():
+        reason = "permission"
+    else:
+        reason = "input"
+
+os.makedirs(state_dir, mode=0o700, exist_ok=True)
+path = os.path.join(state_dir, pane.lstrip("%") + ".json")
+now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+since = now
+try:
+    with open(path) as f:
+        old = json.load(f)
+    if isinstance(old, dict) and old.get("state") == state and old.get("since"):
+        since = old["since"]
+except (OSError, ValueError):
+    pass
+
+record = {
+    "v": 1,
+    "pane": pane,
+    "agent": "claude",
+    "session_id": payload.get("session_id"),
+    "state": state,
+    "reason": reason,
+    "message": message,
+    "event": payload.get("hook_event_name"),
+    "cwd": payload.get("cwd"),
+    "ts": now,
+    "since": since,
+}
+# Readers glob *.json, so the temp name must not end in .json
+tmp = f"{path}.{os.getpid()}.tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as f:
+    json.dump(record, f)
+os.replace(tmp, path)
+' "$state" "$TMUX_PANE" "$STATE_DIR" 2>/dev/null || true
+  return 0
 }
 
 # Safely merge tm's SessionStart recorder into the user's Claude settings.
@@ -2165,6 +2245,7 @@ case "${1:-}" in
   _create)         _cmd_create ;;
   _summarize)      _cmd_summarize "${2:-}" ;;
   _record-claude-session) _cmd_record_claude_session ;;
+  hook-state)      _cmd_hook_state "${2:-}" ;;
 
   # User-facing CLI commands (only need tmux, not fzf)
   new|create)      _check_cmd tmux; _cmd_quick_new "${@:2}" ;;
