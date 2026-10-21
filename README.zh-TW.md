@@ -168,7 +168,7 @@ tm templates                # 列出可用模板
 tm protect myapp            # 切換保護狀態
 tm summarize myapp          # 產生單一 session 的 AI 摘要
 tm summarize-all            # 產生所有 session 的 AI 摘要
-tm install-claude-hook      # 啟用精確的 Claude session ID 追蹤
+tm install-claude-hook      # 啟用 Claude session ID 追蹤與 agent 狀態
 tm save                     # 備份所有 session（重開機後可還原）
 tm restore                  # 從快照還原 session
 tm restore --claude         # 還原 session 並自動啟動 Claude Code
@@ -205,6 +205,24 @@ cp completions/tm.zsh ~/.zsh/completions/_tm
 
 ---
 
+## Agent 狀態
+
+執行 `tm install-claude-hook` 後，Claude Code hooks 會回報每個 agent 的狀態，選單在 session 狀態旁顯示：
+
+| 圖示 | 狀態 | 意義 |
+|------|------|------|
+| `⏳` | working | 正在處理 prompt |
+| `⏳?` | working（逾時） | 超過 `TM_STALE_AFTER` 秒沒有 hook 更新，可能卡住或 hook 失效 |
+| `❓` | blocked | 等你回應：權限確認或要求輸入 |
+| `💤` | idle | 一輪結束，等待下一個 prompt |
+| `·` | unknown | 沒有 agent、agent 已結束，或沒裝 hook |
+
+- 一個 session 有多個 agent 時，顯示最需要注意的狀態（blocked > working > idle）。
+- 有 blocked agent 的 session 會排到最上面；設定 `TM_SORT=recent` 可維持單純的最近使用排序。
+- Preview 面板列出每個 agent pane 的狀態、持續多久，blocked 時另外顯示通知訊息。
+- 狀態依 pane 存放在 `~/.tmux-manager/state/<pane>.json`（僅擁有者可讀）；`tm save` 會清掉已不存在的 pane 的檔案。
+- Hook 在 Claude session 啟動時載入，安裝後需重啟執行中的 Claude session。
+
 ## 防呆機制
 
 三道防線，防止誤殺 session：
@@ -219,6 +237,8 @@ cp completions/tm.zsh ~/.zsh/completions/_tm
 |--------------------|---------------------|--------------------------|
 | `TM_PROJECT_BASE`  | tm.sh 上兩層目錄     | 新建 session 時的目錄選單 |
 | `TM_SNAPSHOT_KEEP` | `48`                 | `tm save` 保留的帶時間戳快照份數 |
+| `TM_SORT`          | （未設定）            | 設為 `recent` 時不把 blocked 排到最上面 |
+| `TM_STALE_AFTER`   | `1800`               | working 超過幾秒沒有 hook 更新就顯示 `⏳?` |
 
 ---
 
@@ -229,10 +249,10 @@ cp completions/tm.zsh ~/.zsh/completions/_tm
 
 `tm save` 會將每個 session 的名稱、工作目錄、執行中的 agent，以及可取得的 Claude Code 或 Codex 精確 session ID 寫入 JSON 快照。還原時會優先使用記錄的 ID，因此即使同一工作目錄有多個 agent session，也能分別續接。
 
-首次使用前執行一次 Claude `SessionStart` hook 安裝指令，建立 tmux pane 與 session ID 的對應。安裝器會保留既有設定與 hooks，修改既有 `~/.claude/settings.json` 前也會建立含時間戳的備份。hook 只記錄 pane ID、session UUID、工作目錄與時間戳，不會讀取對話內容。
+首次使用前執行一次 Claude `SessionStart` hook 安裝指令，建立 tmux pane 與 session ID 的對應。安裝器會保留既有設定與 hooks，修改既有 `~/.claude/settings.json` 前也會建立含時間戳的備份。session hook 只記錄 pane ID、session UUID、工作目錄與時間戳，不會讀取對話內容。同一個指令也會安裝 [agent 狀態](#agent-狀態) hooks；agent 處於 blocked 時，會另外保存 Claude 的通知文字（例如 `Claude needs your permission to use Bash`）。
 
 ```bash
-tm install-claude-hook   # 一次性設定，啟用精確 Claude session 追蹤
+tm install-claude-hook   # 一次性設定，啟用 Claude session 追蹤與 agent 狀態
 tm save                  # 備份所有 session
 tm restore               # 從快照還原（已存在的 session 會跳過）
 tm restore --claude      # 還原 session 並自動啟動 Claude Code

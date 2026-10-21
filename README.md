@@ -167,7 +167,7 @@ tm templates                # List available templates
 tm protect myapp            # Toggle protection status
 tm summarize myapp          # Generate AI summary for a session
 tm summarize-all            # Generate AI summaries for all sessions
-tm install-claude-hook      # Enable exact Claude session ID tracking
+tm install-claude-hook      # Enable Claude session ID tracking and agent state
 tm save                     # Snapshot all sessions (for restore after reboot)
 tm restore                  # Restore sessions from snapshot
 tm restore --claude         # Restore sessions and auto-launch Claude Code
@@ -204,6 +204,24 @@ cp completions/tm.zsh ~/.zsh/completions/_tm
 
 ---
 
+## Agent State
+
+After `tm install-claude-hook`, Claude Code hooks report each agent's state, and the menu shows it next to the session status:
+
+| Icon | State | Meaning |
+|------|-------|---------|
+| `⏳` | working | Processing a prompt |
+| `⏳?` | working (stale) | No hook update for `TM_STALE_AFTER` seconds — may be stuck, or the hook stopped |
+| `❓` | blocked | Waiting for you: a permission prompt or an input request |
+| `💤` | idle | Turn finished, waiting for the next prompt |
+| `·` | unknown | No agent, agent exited, or hooks not installed |
+
+- A session with several agents shows the one that needs attention most (blocked > working > idle).
+- Sessions with a blocked agent float to the top. Set `TM_SORT=recent` to keep the plain most-recent order.
+- The preview panel lists each agent pane with its state, how long it has been in that state, and the notification message when blocked.
+- States are stored per pane in `~/.tmux-manager/state/<pane>.json` (owner-only). `tm save` removes files of panes that no longer exist.
+- Hooks load when a Claude session starts: restart running Claude sessions after installing.
+
 ## Safety Mechanisms
 
 Three layers of protection to prevent accidental session termination:
@@ -218,6 +236,8 @@ Three layers of protection to prevent accidental session termination:
 |--------------------|----------------------------|--------------------------------------|
 | `TM_PROJECT_BASE`  | Two levels above tm.sh     | Directory menu for creating new sessions |
 | `TM_SNAPSHOT_KEEP` | `48`                       | Number of timestamped snapshots kept by `tm save` |
+| `TM_SORT`          | (unset)                    | `recent` stops floating blocked agents to the top |
+| `TM_STALE_AFTER`   | `1800`                     | Seconds without a hook update before working shows as `⏳?` |
 
 ---
 
@@ -228,10 +248,10 @@ Three layers of protection to prevent accidental session termination:
 
 `tm save` captures a JSON snapshot of every session — name, working directory, running agent, and the exact Claude Code or Codex session ID when available. Restore uses the recorded ID first, so multiple agent sessions in the same working directory remain distinct.
 
-Install the Claude `SessionStart` hook once to map each tmux pane to its session ID. The installer preserves existing settings and hooks, and creates a timestamped backup before changing an existing `~/.claude/settings.json`. The hook records only the pane ID, session UUID, working directory, and timestamp — never conversation content.
+Install the Claude `SessionStart` hook once to map each tmux pane to its session ID. The installer preserves existing settings and hooks, and creates a timestamped backup before changing an existing `~/.claude/settings.json`. The session hook records only the pane ID, session UUID, working directory, and timestamp — never conversation content. The same command also installs the [agent state](#agent-state) hooks; when an agent is blocked they also keep Claude's notification text (for example `Claude needs your permission to use Bash`).
 
 ```bash
-tm install-claude-hook   # One-time setup for exact Claude session tracking
+tm install-claude-hook   # One-time setup for Claude session tracking and agent state
 tm save                  # Snapshot all sessions
 tm restore               # Recreate sessions from snapshot (skip existing)
 tm restore --claude      # Also auto-launch Claude Code where it was running

@@ -565,6 +565,31 @@ _cmd_preview() {
     fi
   fi
 
+  # Agent states (section hidden when no pane has a valid state file)
+  local agent_lines
+  agent_lines=$(tmux list-panes -t "$name" -s \
+    -F $'#{session_name}\t#{pane_id}\t#{session_created}\t#{window_index}.#{pane_index}' 2>/dev/null \
+    | _agent_states pane) || agent_lines=""
+  if [[ -n "$agent_lines" ]]; then
+    echo ""
+    echo -e "${C_BOLD}── Agents ───────────────────────────${C_RESET}"
+    local a_target a_pane a_state a_since a_reason a_message a_label
+    while IFS=$'\t' read -r a_target a_pane a_state a_since a_reason a_message; do
+      _state_icon "$a_state"
+      a_label="$a_state"
+      [[ "$a_reason" != "-" ]] && a_label+=" (${a_reason})"
+      if [[ "$a_state" == "blocked" ]]; then
+        echo -e "  ${_STATE_ICON} ${a_target}  ${C_RED}${a_label}${C_RESET} · $(_relative_time "$a_since")"
+      else
+        echo -e "  ${_STATE_ICON} ${a_target}  ${a_label} · $(_relative_time "$a_since")"
+      fi
+      if [[ "$a_state" == "blocked" && "$a_message" != "-" ]]; then
+        # printf, not echo -e: the message is agent text and may contain backslashes
+        printf '     %s%s%s\n' "$C_DIM" "$a_message" "$C_RESET"
+      fi
+    done <<< "$agent_lines"
+  fi
+
   echo ""
   echo -e "${C_BOLD}── Running Processes ────────────────${C_RESET}"
 
@@ -1875,6 +1900,37 @@ PY
   IFS=$'\t' read -r n_sess n_win n_pane <<<"$summary"
 
   echo -e "${C_GREEN}✓${C_RESET} Saved ${C_BOLD}${n_sess:-0}${C_RESET} sessions · ${C_BOLD}${n_win:-0}${C_RESET} windows · ${C_BOLD}${n_pane:-0}${C_RESET} panes → ${C_DIM}${SNAPSHOT_FILE}${C_RESET}"
+
+  _clean_orphan_states
+}
+
+# Remove agent state files whose pane no longer exists. Runs from 'tm save'
+# (often under cron), so a failure only warns and never fails the save.
+_clean_orphan_states() {
+  [[ -d "$STATE_DIR" ]] || return 0
+  local removed
+  removed=$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null | python3 -I -S -c '
+import glob, os, sys
+
+live = {line.strip().lstrip("%") for line in sys.stdin if line.strip()}
+removed = 0
+if not live:
+    # tmux returned nothing (server gone mid-save): never treat that as
+    # "every pane is dead"
+    print(removed)
+    sys.exit(0)
+for path in glob.glob(os.path.join(sys.argv[1], "*.json")):
+    if os.path.basename(path)[:-len(".json")] not in live:
+        os.remove(path)
+        removed += 1
+print(removed)
+' "$STATE_DIR") || {
+    echo -e "${C_YELLOW}⚠ Could not clean orphan agent state files${C_RESET}" >&2
+    return 0
+  }
+  if [[ "${removed:-0}" -gt 0 ]]; then
+    echo -e "${C_DIM}Removed ${removed} orphan state file(s) from ${STATE_DIR}${C_RESET}"
+  fi
 }
 
 # Resolve a snapshot reference to a file path.
