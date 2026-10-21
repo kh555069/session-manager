@@ -35,6 +35,12 @@ readonly CONFIG_DIR="${HOME}/.tmux-manager"
 readonly PROTECTED_FILE="${CONFIG_DIR}/protected.txt"
 readonly CLAUDE_SESSION_MAP="${CONFIG_DIR}/claude_sessions.jsonl"
 readonly STATE_DIR="${CONFIG_DIR}/state"
+# Seconds without a hook write before a working agent is shown as "working?"
+if [[ "${TM_STALE_AFTER:-}" =~ ^[1-9][0-9]*$ ]]; then
+  readonly STALE_AFTER="$TM_STALE_AFTER"
+else
+  readonly STALE_AFTER=1800
+fi
 readonly CLAUDE_PROJECTS="${HOME}/.claude/projects"
 readonly CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
 readonly SCRIPT_DIR="${SELF%/*}"
@@ -64,6 +70,7 @@ readonly IMPORTANT_PROCS="claude|codex|python|node|npm|cargo|go|java|docker|kube
 # Performance cache for batch queries (populated by _build_list_cache)
 _CACHED_SESSION_DATA=""
 _CACHED_PROTECTED=""
+_CACHED_AGENT_STATE=""
 _CACHE_LOADED=0
 
 # ─── 2. Init & Dependency Check ───────────────────────
@@ -196,7 +203,99 @@ _build_list_cache() {
       }')
   _CACHED_PROTECTED=""
   [[ -f "$PROTECTED_FILE" ]] && _CACHED_PROTECTED=$(<"$PROTECTED_FILE")
+  _CACHED_AGENT_STATE=$(tmux list-panes -a \
+    -F $'#{session_name}\t#{pane_id}\t#{session_created}\t#{window_index}.#{pane_index}' 2>/dev/null \
+    | _agent_states session) || _CACHED_AGENT_STATE=""
   _CACHE_LOADED=1
+}
+
+# Read agent state files for the panes given on stdin.
+# Input lines:  SESSION \t PANE_ID \t SESSION_CREATED \t WIN.PANE
+# Mode session: SESSION \t AGG_STATE  (blocked > working? > working > idle > unknown)
+# Mode pane:    WIN.PANE \t PANE_ID \t STATE \t SINCE_EPOCH \t REASON \t MESSAGE
+#               (only panes with a valid state file; empty REASON/MESSAGE → "-")
+# A state file is ignored when unreadable, when its state is unknown, or when
+# it predates its session (pane ids restart after a tmux server restart).
+_agent_states() {
+  local mode="$1"
+  command -v python3 &>/dev/null || return 0
+  python3 -I -S -c '
+import calendar, json, os, sys, time
+
+mode, state_dir, stale_after = sys.argv[1], sys.argv[2], int(sys.argv[3])
+now = time.time()
+rank = {"unknown": 0, "idle": 1, "working": 2, "working?": 3, "blocked": 4}
+
+def epoch(value):
+    try:
+        return calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ"))
+    except (TypeError, ValueError):
+        return None
+
+def clean(value):
+    text = " ".join(str(value).split()) if value else ""
+    return text or "-"
+
+order, agg = [], {}
+for line in sys.stdin:
+    parts = line.rstrip("\n").split("\t")
+    if len(parts) != 4:
+        continue
+    session, pane, created, target = parts
+    if session not in agg:
+        order.append(session)
+        agg[session] = "unknown"
+    try:
+        with open(os.path.join(state_dir, pane.lstrip("%") + ".json")) as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        continue
+    if not isinstance(record, dict):
+        continue
+    state = record.get("state")
+    ts, since = epoch(record.get("ts")), epoch(record.get("since"))
+    if state not in ("working", "blocked", "idle", "dead") or ts is None:
+        continue
+    if created.isdigit() and ts < int(created):
+        continue
+    if state == "dead":
+        state = "unknown"
+    elif state == "working" and now - ts > stale_after:
+        state = "working?"
+    if rank[state] > rank[agg[session]]:
+        agg[session] = state
+    if mode == "pane" and state != "unknown":
+        print("\t".join([target, pane, state, str(since or ts),
+                         clean(record.get("reason")), clean(record.get("message"))]))
+
+if mode == "session":
+    for session in order:
+        print(f"{session}\t{agg[session]}")
+' "$mode" "$STATE_DIR" "$STALE_AFTER"
+}
+
+# Aggregated agent state of a session from the list cache → $_AGENT_STATE
+# (default: unknown). Sets a global instead of echoing to avoid a subshell fork.
+_session_agent_state() {
+  local name="$1" s st
+  _AGENT_STATE="unknown"
+  while IFS=$'\t' read -r s st; do
+    if [[ "$s" == "$name" ]]; then
+      _AGENT_STATE="$st"
+      return
+    fi
+  done <<< "$_CACHED_AGENT_STATE"
+}
+
+# Icon for an agent state → $_STATE_ICON
+_state_icon() {
+  case "$1" in
+    blocked)   _STATE_ICON="❓" ;;
+    working)   _STATE_ICON="⏳" ;;
+    working\?) _STATE_ICON="⏳?" ;;
+    idle)      _STATE_ICON="💤" ;;
+    *)         _STATE_ICON="·" ;;
+  esac
 }
 
 _clear_list_cache() {
@@ -299,6 +398,9 @@ _format_session_line() {
   else
     status="${grp_color}[○]${C_RESET}"
   fi
+  _session_agent_state "$name"
+  _state_icon "$_AGENT_STATE"
+  status+=" ${_STATE_ICON}"
 
   # Protection lock icon
   if _is_protected "$name"; then
@@ -356,18 +458,34 @@ _cmd_list() {
   fi
   # Column header (frozen by --header-lines=1 in fzf)
   if _is_narrow; then
-    printf "     \t%-16s\t%s\t%s\t%s\n" "NAME" "W" "P" "IDLE"
+    printf "ST   \t%-16s\t%s\t%s\t%s\n" "NAME" "W" "P" "IDLE"
   else
-    printf "     \t%-20s\t%-30s\t%s\t%s\t%s\n" "NAME" "DIRECTORY" "W" "P" "IDLE"
+    printf "ST   \t%-20s\t%-30s\t%s\t%s\t%s\n" "NAME" "DIRECTORY" "W" "P" "IDLE"
   fi
   # Batch pre-cache to avoid per-session fork overhead
   _build_list_cache
   _CURRENT_SESSION=$(_current_session)
   _NOW=$(date +%s)
-  # Sort by session_last_attached descending (most recent first)
-  while IFS=';' read -r name attached windows path _last_attached activity; do
-    _format_session_line "$name" "$attached" "$windows" "$path" "$activity"
-  done < <(sort -t';' -k5,5 -rn <<< "$sessions_raw")
+  # Sort by session_last_attached descending (most recent first).
+  # Unless TM_SORT=recent, sessions with a blocked agent go first (two passes
+  # keep the recency order inside each group).
+  local sorted pass blocked
+  sorted=$(sort -t';' -k5,5 -rn <<< "$sessions_raw")
+  for pass in blocked rest; do
+    if [[ "${TM_SORT:-}" == "recent" ]]; then
+      [[ "$pass" == "blocked" ]] && continue
+    fi
+    while IFS=';' read -r name attached windows path _last_attached activity; do
+      if [[ "${TM_SORT:-}" != "recent" ]]; then
+        blocked=0
+        _session_agent_state "$name"
+        [[ "$_AGENT_STATE" == "blocked" ]] && blocked=1
+        [[ "$pass" == "blocked" && $blocked -eq 0 ]] && continue
+        [[ "$pass" == "rest" && $blocked -eq 1 ]] && continue
+      fi
+      _format_session_line "$name" "$attached" "$windows" "$path" "$activity"
+    done <<< "$sorted"
+  done
 }
 
 # Preview panel (fzf bottom panel)
@@ -933,6 +1051,9 @@ ${C_BOLD}Environment variables:${C_RESET}
                      Default: two levels above tm.sh
   TM_SNAPSHOT_KEEP   Number of timestamped snapshots kept by 'tm save'
                      Default: 48
+  TM_SORT            Set to 'recent' to stop floating blocked agents to the top
+  TM_STALE_AFTER     Seconds without a hook update before working shows as ⏳?
+                     Default: 1800
 EOF
 }
 
