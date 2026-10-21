@@ -207,15 +207,19 @@ tm wait <target> --until <cond> [--timeout 30m] [--interval 2] [--match any|all]
 ```bash
 scripts=~/project/catalog-manager/scripts
 
-# 派工前：確認 session 內沒有既有 Worker
-guard=$(bash "$scripts/agent-instance-guard.sh" api-server); guard_exit=$?
-eval "$guard"   # sets COUNT, PANE, INFO, AGENT
-[ "$guard_exit" -eq 0 ] && [ "$COUNT" -eq 0 ] || exit 1   # 已有 Worker 時改走既有流程或一次性 pane
+# 派工前：session 已存在時，確認裡面沒有既有 Worker
+# （guard 對不存在的 session 回 3，所以先判斷 session 是否存在）
+if tmux has-session -t api-server 2>/dev/null; then
+  guard=$(bash "$scripts/agent-instance-guard.sh" api-server); guard_exit=$?
+  eval "$guard"   # sets COUNT, PANE, INFO, AGENT
+  [ "$guard_exit" -eq 0 ] && [ "$COUNT" -eq 0 ] || exit 1   # 已有 Worker 時改走既有流程或一次性 pane
+else
+  tm new api-server ~/project/api-server
+fi
 
 # 啟動 Worker：指令只能來自 planner，不自行組裝
 plan=$(bash "$scripts/worker-session.sh" plan api-server claude-code ~/project/api-server true) || exit 1
 eval "$plan"    # sets MODE, SESSION_ID, REASON, CMD
-tm new api-server ~/project/api-server
 tmux send-keys -t api-server "$CMD" Enter
 
 # 重新跑 guard 取得 Worker 所在 pane，再等它啟動完成
