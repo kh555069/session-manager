@@ -202,25 +202,54 @@ tm wait <target> --until <cond> [--timeout 30m] [--interval 2] [--match any|all]
 
 ### Leader 使用範例
 
+範例以 Leader Agent 的派工流程為準（`~/project/catalog-manager` 的 `/dispatch`）：啟動指令由 `worker-session.sh plan` 產生，任務文字一律經 `agent-prompt.sh` 從 stdin 送出，不直接用 `tmux send-keys` 或 `paste-buffer` 注入。`tm wait` 只負責等待，`blocked` 時停下交給使用者，Leader 不代為回答。
+
 ```bash
-# 派工
-tm new worker-1 ~/project/api-server
-tmux send-keys -t worker-1 'claude' Enter
-tm wait worker-1 --until idle --timeout 60s        # 等 SessionStart
-tmux send-keys -t worker-1 '實作 /healthz endpoint 並補上測試' Enter
+scripts=~/project/catalog-manager/scripts
+
+# 派工前：確認 session 內沒有既有 Worker
+guard=$(bash "$scripts/agent-instance-guard.sh" api-server); guard_exit=$?
+eval "$guard"   # sets COUNT, PANE, INFO, AGENT
+[ "$guard_exit" -eq 0 ] && [ "$COUNT" -eq 0 ] || exit 1   # 已有 Worker 時改走既有流程或一次性 pane
+
+# 啟動 Worker：指令只能來自 planner，不自行組裝
+plan=$(bash "$scripts/worker-session.sh" plan api-server claude-code ~/project/api-server true) || exit 1
+eval "$plan"    # sets MODE, SESSION_ID, REASON, CMD
+tm new api-server ~/project/api-server
+tmux send-keys -t api-server "$CMD" Enter
+
+# 重新跑 guard 取得 Worker 所在 pane，再等它啟動完成
+eval "$(bash "$scripts/agent-instance-guard.sh" api-server)"
+start=$(tm wait "api-server:$PANE" --until done --timeout 60s) || exit 1
+[ "$(jq -r .state <<<"$start")" = blocked ] && { echo "啟動對話框待處理，請 attach"; exit 1; }
+
+# 送出任務：stdin 傳入，避免引號被 shell 解讀
+result=$(printf '%s' '實作 /healthz endpoint 並補上測試' \
+  | bash "$scripts/agent-prompt.sh" api-server "$PANE")
+prompt_exit=$?
+eval "$result"  # sets RESULT, REASON, STATE, RULE
+case $prompt_exit in
+  0) ;;
+  12) echo "prompt_stalled：文字可能還在輸入框，不得重送"; exit 1 ;;
+  *) echo "未送出：$REASON"; exit 1 ;;
+esac
 
 # 等完成或卡住
-result=$(tm wait worker-1 --until done --after-change --timeout 45m)
+result=$(tm wait "api-server:$PANE" --until done --after-change --timeout 45m)
 case $? in
-  0) state=$(jq -r .state <<<"$result")
-     [ "$state" = blocked ] && echo "需要處理：$(jq -r .message <<<"$result")" ;;
-  1) echo "worker-1 逾時，仍在 working" ;;
-  2) echo "worker-1 已結束" ;;
+  0) [ "$(jq -r .state <<<"$result")" = blocked ] \
+       && echo "需要使用者處理：$(jq -r .message <<<"$result")" ;;
+  1) echo "api-server 逾時，仍在 working" ;;
+  2) echo "api-server 已結束" ;;
 esac
 
 # 多個 worker：任一完成就先處理
 tm wait --all --until done --after-change --match any
 ```
+
+- 啟動後用 `--until done` 而不是 `idle`：信任資料夾、升級提示等對話框會讓 Worker 停在 `blocked`，只等 `idle` 會一路等到逾時。
+- `agent-prompt.sh` 回 `12` 時文字可能還留在輸入框，重送會變成兩份任務，必須先交給使用者判斷。
+- 本節的 `tm wait` 是 `agent-state.sh wait` 的候選替代；在 Leader 規則改版前，Worker 狀態判讀仍以 `agent-state.sh` 為準。
 
 ### 實作方式
 
