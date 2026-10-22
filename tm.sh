@@ -1359,7 +1359,7 @@ _ls_json() {
   python3 -I -S -c "${_PY_STATE_LIB}"'
 import socket, subprocess
 
-states_csv, agent_filter, session_filter, no_summary, config_dir, stale_after = sys.argv[1:7]
+states_csv, agent_filter, session_filter, no_summary, config_dir, state_dir, stale_after = sys.argv[1:8]
 stale_after = int(stale_after)
 now = time.time()
 
@@ -1427,7 +1427,7 @@ try:
 except OSError:
     protected = set()
 
-sessions = {}
+sessions, panes = {}, []
 for line in listing.stdout.splitlines():
     parts = line.split("\t")
     if len(parts) != len(fields):
@@ -1449,6 +1449,69 @@ for line in listing.stdout.splitlines():
             "agents": [],
         }
     sessions[name]["panes"] += 1
+    panes.append(row)
+
+# One ps call for the whole process tree
+children, args = {}, {}
+ps = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "args="],
+                    capture_output=True, text=True)
+for line in ps.stdout.splitlines():
+    parts = line.split(None, 2)
+    if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        continue
+    pid, ppid = int(parts[0]), int(parts[1])
+    children.setdefault(ppid, []).append(pid)
+    args[pid] = parts[2] if len(parts) == 3 else ""
+
+def detect_agent(root):
+    # BFS from the pane shell; an agent is a process whose first or second
+    # argv token is named claude/codex (direct run, or node/bash running it)
+    queue, seen = [root], set()
+    while queue:
+        pid = queue.pop(0)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        for token in args.get(pid, "").split()[:2]:
+            name = os.path.basename(token)
+            if name in ("claude", "codex"):
+                return name, pid
+        queue.extend(children.get(pid, []))
+    return None, None
+
+for row in panes:
+    session = sessions[row["session_name"]]
+    root = int(row["pane_pid"]) if row["pane_pid"].isdigit() else None
+    found, pid = detect_agent(root) if root is not None else (None, None)
+    loaded = load_state(state_dir, row["pane_id"], row["session_created"], now, stale_after)
+    if loaded is not None and loaded["state"] == "unknown" and found is None:
+        loaded = None  # dead agent, nothing running
+    if loaded is None and found is None:
+        continue
+    record = loaded["record"] if loaded else {}
+    recorded_agent = record.get("agent")
+    session["agents"].append({
+        "pane": row["pane_id"],
+        "target": row["session_name"] + ":" + row["window_index"] + "." + row["pane_index"],
+        "agent": recorded_agent if isinstance(recorded_agent, str) and recorded_agent else found,
+        "pid": pid,
+        "session_id": record.get("session_id") if loaded else None,
+        "state": loaded["state"] if loaded else "unknown",
+        "stale": loaded["stale"] if loaded else False,
+        "since": iso(loaded["since"]) if loaded else None,
+        "reason": record.get("reason") if loaded else None,
+        "message": record.get("message") if loaded else None,
+        "source": "hook" if loaded else "heuristic",
+        "_order": (int(row["window_index"] or 0), int(row["pane_index"] or 0)),
+    })
+
+rank = {"unknown": 0, "idle": 1, "working": 2, "blocked": 3}
+for session in sessions.values():
+    session["agents"].sort(key=lambda agent: agent["_order"])
+    for agent in session["agents"]:
+        del agent["_order"]
+        if rank[agent["state"]] > rank[session["state"]]:
+            session["state"] = agent["state"]
 
 result = {
     "v": 1,
@@ -1458,7 +1521,7 @@ result = {
 }
 json.dump(result, sys.stdout, ensure_ascii=False)
 sys.stdout.write("\n")
-' "$1" "$2" "$3" "$4" "$CONFIG_DIR" "$STALE_AFTER"
+' "$1" "$2" "$3" "$4" "$CONFIG_DIR" "$STATE_DIR" "$STALE_AFTER"
 }
 
 # ─── 10. AI Summary ──────────────────────────────────

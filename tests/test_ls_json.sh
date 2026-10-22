@@ -104,4 +104,115 @@ test_plain_ls_unchanged() {
   assert_contains "$("$TM" ls)" "NAME" header
 }
 
+# ─── Task 2: agents ───────────────────────────────────
+
+test_hook_agent_fields() {
+  new_session a
+  set_state a blocked '{"notification_type":"permission_prompt","message":"Claude needs your permission to use Bash","session_id":"s-1"}'
+  local out; out=$("$TM" ls --json)
+  assert_eq '["agent", "message", "pane", "pid", "reason", "session_id", "since", "source", "stale", "state", "target"]' \
+    "$(json 'sorted(d["sessions"][0]["agents"][0])' <<< "$out")" agent-keys
+  assert_eq "$(pane_id a)" "$(json 'd["sessions"][0]["agents"][0]["pane"]' <<< "$out")" pane
+  assert_eq a:0.0 "$(json 'd["sessions"][0]["agents"][0]["target"]' <<< "$out")" target
+  assert_eq claude "$(json 'd["sessions"][0]["agents"][0]["agent"]' <<< "$out")" agent
+  assert_eq null "$(json 'd["sessions"][0]["agents"][0]["pid"]' <<< "$out")" pid-without-process
+  assert_eq s-1 "$(json 'd["sessions"][0]["agents"][0]["session_id"]' <<< "$out")" session_id
+  assert_eq blocked "$(json 'd["sessions"][0]["agents"][0]["state"]' <<< "$out")" state
+  assert_eq permission "$(json 'd["sessions"][0]["agents"][0]["reason"]' <<< "$out")" reason
+  assert_eq 'Claude needs your permission to use Bash' "$(json 'd["sessions"][0]["agents"][0]["message"]' <<< "$out")" message
+  assert_eq hook "$(json 'd["sessions"][0]["agents"][0]["source"]' <<< "$out")" source
+  assert_eq false "$(json 'd["sessions"][0]["agents"][0]["stale"]' <<< "$out")" not-stale
+  assert_eq blocked "$(json 'd["sessions"][0]["state"]' <<< "$out")" session-state
+  [[ "$(json 'd["sessions"][0]["agents"][0]["since"]' <<< "$out")" =~ Z$ ]] || fail "since format"
+}
+
+test_process_only_agent_is_heuristic() {
+  fake_agent codex
+  tmux new-session -d -s a -c "$TEST_TMP" "$TEST_TMP/bin/codex"
+  sleep 0.3
+  local out; out=$("$TM" ls --json)
+  assert_eq codex "$(json 'd["sessions"][0]["agents"][0]["agent"]' <<< "$out")" agent
+  assert_eq "$(agent_pid codex)" "$(json 'd["sessions"][0]["agents"][0]["pid"]' <<< "$out")" pid
+  assert_eq unknown "$(json 'd["sessions"][0]["agents"][0]["state"]' <<< "$out")" state
+  assert_eq heuristic "$(json 'd["sessions"][0]["agents"][0]["source"]' <<< "$out")" source
+  assert_eq null "$(json 'd["sessions"][0]["agents"][0]["since"]' <<< "$out")" since
+}
+
+test_hook_and_process_merge() {
+  fake_agent claude
+  tmux new-session -d -s a -c "$TEST_TMP" "$TEST_TMP/bin/claude"
+  sleep 0.3
+  set_state a working
+  local out; out=$("$TM" ls --json)
+  assert_eq 1 "$(json 'len(d["sessions"][0]["agents"])' <<< "$out")" one-agent
+  assert_eq hook "$(json 'd["sessions"][0]["agents"][0]["source"]' <<< "$out")" source
+  assert_eq "$(agent_pid claude)" "$(json 'd["sessions"][0]["agents"][0]["pid"]' <<< "$out")" pid
+}
+
+test_aggregate_and_target_order() {
+  new_session a
+  tmux split-window -d -t a "sleep 600"
+  set_state a:0.0 idle
+  set_state a:0.1 working
+  local out; out=$("$TM" ls --json)
+  assert_eq '["a:0.0", "a:0.1"]' "$(json '[x["target"] for x in d["sessions"][0]["agents"]]' <<< "$out")" order
+  assert_eq working "$(json 'd["sessions"][0]["state"]' <<< "$out")" aggregate
+}
+
+test_stale_working_flag() {
+  new_session a
+  set_state a working
+  local f created; f="$STATE_DIR/$(pane_id a | tr -d %).json"
+  created=$(tmux display-message -p -t a '#{session_created}')
+  # ts one second after the session was created: valid, but older than TM_STALE_AFTER=1
+  python3 - "$f" "$created" <<'PY2'
+import json, sys, time
+p, created = sys.argv[1], int(sys.argv[2])
+d = json.load(open(p))
+d["ts"] = d["since"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created + 1))
+json.dump(d, open(p, "w"))
+PY2
+  sleep 2
+  local out; out=$(TM_STALE_AFTER=1 "$TM" ls --json)
+  assert_eq working "$(json 'd["sessions"][0]["agents"][0]["state"]' <<< "$out")" state
+  assert_eq true "$(json 'd["sessions"][0]["agents"][0]["stale"]' <<< "$out")" stale
+}
+
+test_dead_without_process_is_dropped() {
+  new_session a
+  set_state a dead
+  assert_eq '[]' "$("$TM" ls --json | json 'd["sessions"][0]["agents"]')" dropped
+}
+
+test_corrupt_state_with_process_is_heuristic() {
+  fake_agent claude
+  tmux new-session -d -s a -c "$TEST_TMP" "$TEST_TMP/bin/claude"
+  sleep 0.3
+  mkdir -p "$STATE_DIR"
+  echo '{broken' > "$STATE_DIR/$(pane_id a | tr -d %).json"
+  local out code
+  out=$("$TM" ls --json 2>/dev/null); code=$?
+  assert_eq 0 "$code" exit
+  assert_eq heuristic "$(json 'd["sessions"][0]["agents"][0]["source"]' <<< "$out")" source
+  assert_eq unknown "$(json 'd["sessions"][0]["agents"][0]["state"]' <<< "$out")" state
+}
+
+test_state_older_than_session_ignored() {
+  new_session a
+  set_state a blocked
+  local f; f="$STATE_DIR/$(pane_id a | tr -d %).json"
+  python3 - "$f" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p)); d["ts"] = d["since"] = "2000-01-01T00:00:00Z"; json.dump(d, open(p, "w"))
+PY
+  assert_eq '[]' "$("$TM" ls --json | json 'd["sessions"][0]["agents"]')" ignored
+}
+
+test_claude_named_file_is_not_agent() {
+  printf '#!/bin/bash\nsleep 600\n' > "$TEST_TMP/claude.md"
+  tmux new-session -d -s a -c "$TEST_TMP" "bash $TEST_TMP/claude.md"
+  sleep 0.3
+  assert_eq '[]' "$("$TM" ls --json | json 'd["sessions"][0]["agents"]')" not-agent
+}
+
 run_tests
