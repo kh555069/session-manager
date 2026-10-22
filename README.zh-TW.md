@@ -259,7 +259,7 @@ cp completions/tm.zsh ~/.zsh/completions/_tm
 | `4` | tmux server 未啟動 |
 
 - stdout 只放 JSON，警告與錯誤寫 stderr。沒有值的欄位輸出 `null`，不省略 key。
-- `source` 為 `hook` 表示狀態來自 Claude hook；`heuristic` 表示找到 agent 行程但沒有 hook 狀態（Codex 或沒裝 hook），此時狀態為 `unknown`。
+- `source` 為 `hook` 表示狀態來自 Claude hook；`heuristic` 表示找到 agent 行程但沒有 hook 狀態（Codex 或沒裝 hook），此時狀態為 `unknown`。Hook 狀態只在 agent 行程還在時才採信：agent 被強制結束、沒有執行結束 hook 時，pane 仍會列出，但 `pid` 為 `null`、狀態為 `unknown`，不會顯示 `idle`。
 - `stale: true` 表示 `working` 的 agent 已超過 `TM_STALE_AFTER` 秒沒有 hook 更新。
 - `target` 可直接交給 `tmux send-keys -t`。`v` 只在破壞相容時遞增，呼叫端應忽略不認得的 key。
 

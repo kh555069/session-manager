@@ -258,7 +258,7 @@ After `tm install-claude-hook`, Claude Code hooks report each agent's state, and
 | `4` | No tmux server is running |
 
 - stdout carries only JSON; warnings and errors go to stderr. Missing values are `null`, keys are never omitted.
-- `source` is `hook` when the state comes from a Claude hook, `heuristic` when an agent process was found but no hook state exists (Codex, or hooks not installed). Heuristic agents are `unknown`.
+- `source` is `hook` when the state comes from a Claude hook, `heuristic` when an agent process was found but no hook state exists (Codex, or hooks not installed). Heuristic agents are `unknown`. A hook state is only trusted while the agent process is still running: if the agent was killed without its exit hook, the pane stays listed with `pid: null` and state `unknown`, never `idle`.
 - `stale: true` marks a `working` agent with no hook update for `TM_STALE_AFTER` seconds.
 - `target` can be passed straight to `tmux send-keys -t`. `v` only increases on breaking changes; ignore unknown keys.
 

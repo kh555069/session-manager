@@ -26,6 +26,18 @@ agent_pid() {
   pgrep -f "bash $TEST_TMP/bin/$1"
 }
 
+# agent_pane new|split <session-or-target>: a pane running a fake claude,
+# so hook states are confirmed by a live agent process
+agent_pane() {
+  [[ -x "$TEST_TMP/bin/claude" ]] || fake_agent claude
+  if [[ "$1" == new ]]; then
+    tmux new-session -d -s "$2" -c "$TEST_TMP" "$TEST_TMP/bin/claude"
+  else
+    tmux split-window -d -t "$2" "$TEST_TMP/bin/claude"
+  fi
+  sleep 0.3
+}
+
 # ─── Task 1: session fields ───────────────────────────
 
 test_session_fields() {
@@ -107,7 +119,7 @@ test_plain_ls_unchanged() {
 # ─── Task 2: agents ───────────────────────────────────
 
 test_hook_agent_fields() {
-  new_session a
+  agent_pane new a
   set_state a blocked '{"notification_type":"permission_prompt","message":"Claude needs your permission to use Bash","session_id":"s-1"}'
   local out; out=$("$TM" ls --json)
   assert_eq '["agent", "message", "pane", "pid", "reason", "session_id", "since", "source", "stale", "state", "target"]' \
@@ -115,7 +127,7 @@ test_hook_agent_fields() {
   assert_eq "$(pane_id a)" "$(json 'd["sessions"][0]["agents"][0]["pane"]' <<< "$out")" pane
   assert_eq a:0.0 "$(json 'd["sessions"][0]["agents"][0]["target"]' <<< "$out")" target
   assert_eq claude "$(json 'd["sessions"][0]["agents"][0]["agent"]' <<< "$out")" agent
-  assert_eq null "$(json 'd["sessions"][0]["agents"][0]["pid"]' <<< "$out")" pid-without-process
+  assert_eq "$(agent_pid claude)" "$(json 'd["sessions"][0]["agents"][0]["pid"]' <<< "$out")" pid
   assert_eq s-1 "$(json 'd["sessions"][0]["agents"][0]["session_id"]' <<< "$out")" session_id
   assert_eq blocked "$(json 'd["sessions"][0]["agents"][0]["state"]' <<< "$out")" state
   assert_eq permission "$(json 'd["sessions"][0]["agents"][0]["reason"]' <<< "$out")" reason
@@ -150,8 +162,8 @@ test_hook_and_process_merge() {
 }
 
 test_aggregate_and_target_order() {
-  new_session a
-  tmux split-window -d -t a "sleep 600"
+  agent_pane new a
+  agent_pane split a
   set_state a:0.0 idle
   set_state a:0.1 working
   local out; out=$("$TM" ls --json)
@@ -160,7 +172,7 @@ test_aggregate_and_target_order() {
 }
 
 test_stale_working_flag() {
-  new_session a
+  agent_pane new a
   set_state a working
   local f created; f="$STATE_DIR/$(pane_id a | tr -d %).json"
   created=$(tmux display-message -p -t a '#{session_created}')
@@ -215,13 +227,38 @@ test_claude_named_file_is_not_agent() {
   assert_eq '[]' "$("$TM" ls --json | json 'd["sessions"][0]["agents"]')" not-agent
 }
 
+# ─── Final review fixes ───────────────────────────────
+
+# An agent killed without SessionEnd leaves its last state behind; without a
+# live agent process it must not look idle (a Leader would type into a shell)
+test_hook_state_without_process_is_unknown() {
+  new_session a
+  set_state a idle
+  local out; out=$("$TM" ls --json)
+  assert_eq unknown "$(json 'd["sessions"][0]["agents"][0]["state"]' <<< "$out")" state
+  assert_eq null "$(json 'd["sessions"][0]["agents"][0]["pid"]' <<< "$out")" pid
+  assert_eq unknown "$(json 'd["sessions"][0]["state"]' <<< "$out")" session-state
+}
+
+# A dead record from an earlier agent must not label the agent running now
+test_dead_record_with_new_process_is_heuristic() {
+  fake_agent codex
+  tmux new-session -d -s a -c "$TEST_TMP" "$TEST_TMP/bin/codex"
+  sleep 0.3
+  set_state a dead '{"session_id":"old-claude"}'
+  local out; out=$("$TM" ls --json --agent codex)
+  assert_eq codex "$(json 'd["sessions"][0]["agents"][0]["agent"]' <<< "$out")" agent
+  assert_eq heuristic "$(json 'd["sessions"][0]["agents"][0]["source"]' <<< "$out")" source
+  assert_eq null "$(json 'd["sessions"][0]["agents"][0]["session_id"]' <<< "$out")" session_id
+}
+
 # ─── Task 3: filters and exit codes ───────────────────
 
 names() { json '[s["name"] for s in d["sessions"]]'; }
 
 test_filter_state() {
-  new_session a; new_session b; new_session c
-  tmux split-window -d -t a "sleep 600"
+  agent_pane new a; agent_pane new b; new_session c
+  agent_pane split a
   set_state a:0.0 blocked; set_state a:0.1 idle; set_state b idle
   assert_eq '["a"]' "$("$TM" ls --json --state blocked | names)" blocked
   assert_eq '["a", "b"]' "$("$TM" ls --json --state=idle | names)" idle-equals-form
@@ -231,7 +268,7 @@ test_filter_state() {
 
 test_filter_agent_recomputes_state() {
   fake_agent codex
-  new_session a
+  agent_pane new a
   tmux split-window -d -t a "$TEST_TMP/bin/codex"
   sleep 0.3
   set_state a:0.0 blocked

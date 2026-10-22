@@ -1531,20 +1531,25 @@ for row in panes:
     root = int(row["pane_pid"]) if row["pane_pid"].isdigit() else None
     found, pid = detect_agent(root) if root is not None else (None, None)
     loaded = load_state(state_dir, row["pane_id"], row["session_created"], now, stale_after)
-    if loaded is not None and loaded["state"] == "unknown" and found is None:
-        loaded = None  # dead agent, nothing running
+    if loaded is not None and loaded["state"] == "unknown":
+        loaded = None  # dead record: describes an earlier agent, not the one running now
     if loaded is None and found is None:
         continue
     record = loaded["record"] if loaded else {}
     recorded_agent = record.get("agent")
+    if not (isinstance(recorded_agent, str) and recorded_agent):
+        recorded_agent = None
+    # Without a live agent process the hook state is unconfirmed (e.g. killed
+    # without SessionEnd), so it is never reported as idle/blocked/working
+    confirmed = loaded is not None and found is not None
     session["agents"].append({
         "pane": row["pane_id"],
         "target": row["session_name"] + ":" + row["window_index"] + "." + row["pane_index"],
-        "agent": recorded_agent if isinstance(recorded_agent, str) and recorded_agent else found,
+        "agent": found or recorded_agent,
         "pid": pid,
         "session_id": record.get("session_id") if loaded else None,
-        "state": loaded["state"] if loaded else "unknown",
-        "stale": loaded["stale"] if loaded else False,
+        "state": loaded["state"] if confirmed else "unknown",
+        "stale": loaded["stale"] if confirmed else False,
         "since": iso(loaded["since"]) if loaded else None,
         "reason": record.get("reason") if loaded else None,
         "message": record.get("message") if loaded else None,

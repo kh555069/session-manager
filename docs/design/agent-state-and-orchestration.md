@@ -174,6 +174,7 @@ Codex 可在 `~/.codex/config.toml` 設定 `notify`，於一輪完成時呼叫 `
 
 - **過期的 working**：`state` 仍為 `working`，另加 `stale: true`。狀態維持四個值，`stale` 是新增欄位，不升版。
 - **哪些 pane 列入 `agents`**：有效狀態檔（非 `dead`）或行程樹偵測到 agent，兩者有一即列入。只有行程偵測時 `source` 為 `heuristic`、`state` 為 `unknown`；本 PR 不做畫面比對。
+- **Hook 狀態需要行程佐證**：狀態檔只在行程樹找得到 agent 時採信，否則該 agent 的 `state` 為 `unknown`（`kill -9` 不會觸發 `SessionEnd`，舊的 `idle` 會讓 Leader 把 prompt 送進 shell）。`dead` 紀錄一律忽略，同一 pane 後來啟動的 agent 以 `heuristic` 呈現。
 - **行程偵測**：從 `pane_pid` 走行程樹，args 前兩個 token 的 basename 等於 `claude` 或 `codex` 即為 agent。`vim claude.md` 不會誤判。
 - **篩選語意**：`--agent` 先移除其他 agent，session `state` 依剩下的 agent 重算；`--state` 套在其後，session 有任一 agent 符合就保留整個 session。`--session` 找不到時，不論其他篩選都 exit 2。篩選參數沒有搭配 `--json` 時 exit 3。
 - **`session_id`** 只取狀態檔的值；Codex 要用 `lsof` 查，會超出效能目標，先輸出 `null`。
