@@ -1623,14 +1623,19 @@ _cmd_ls() {
   if [[ $filtered -eq 1 && $json -eq 0 ]]; then
     _ls_usage_error "Filters require --json"
   fi
-  local IFS=','
-  for s in $states; do
+  # read -a splits on commas without pathname expansion ("*" stays "*")
+  local -a state_list=()
+  IFS=, read -r -a state_list <<< "$states"
+  for s in ${state_list[@]+"${state_list[@]}"}; do
     case "$s" in
       blocked|working|idle|unknown) ;;
       *) _ls_usage_error "Invalid state: ${s} (blocked, working, idle, unknown)" ;;
     esac
   done
-  unset IFS
+  case "$agent" in
+    ""|claude|codex) ;;
+    *) _ls_usage_error "Invalid agent: ${agent} (claude, codex)" ;;
+  esac
   _ls_json "$states" "$agent" "$session" "$no_summary"
 }
 
@@ -1695,6 +1700,15 @@ def last_summary(config_dir, name):
         return record["summary"]
     return None
 
+def dumps_safe(obj):
+    """JSON text with C1 controls (U+0080-U+009F) escaped.
+
+    json.dumps escapes C0 controls but not C1, and ensure_ascii=False is kept
+    so other non-ASCII text stays readable; a raw C1 would reach the terminal.
+    """
+    text = json.dumps(obj, ensure_ascii=False)
+    return "".join("\\u%04x" % ord(c) if 0x80 <= ord(c) <= 0x9f else c for c in text)
+
 def aggregate(agents):
     """Session state from its agents: blocked > working > idle > unknown."""
     rank = {"unknown": 0, "idle": 1, "working": 2, "blocked": 3}
@@ -1711,9 +1725,11 @@ def snapshot(config_dir, state_dir, stale_after, now, summary=True, git=True):
     its "state" is left "unknown" for the caller to aggregate.
     panes: every pane in tmux order as {session, window, pane, target}.
     """
-    fields = ["session_name", "session_created", "session_path", "session_windows",
+    # session_path last: it is the only field that may contain a tab, and the
+    # split below leaves the rest of the line to it
+    fields = ["session_name", "session_created", "session_windows",
               "session_attached", "session_activity", "window_index", "pane_index",
-              "pane_id", "pane_pid"]
+              "pane_id", "pane_pid", "session_path"]
     fmt = "\t".join("#{" + f + "}" for f in fields)
     listing = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt],
                              capture_output=True, text=True)
@@ -1728,7 +1744,7 @@ def snapshot(config_dir, state_dir, stale_after, now, summary=True, git=True):
 
     sessions, panes, rows = {}, [], []
     for line in listing.stdout.splitlines():
-        parts = line.split("\t")
+        parts = line.split("\t", len(fields) - 1)
         if len(parts) != len(fields):
             continue
         row = dict(zip(fields, parts))
@@ -1788,10 +1804,16 @@ def snapshot(config_dir, state_dir, stale_after, now, summary=True, git=True):
             if pid in seen:
                 continue
             seen.add(pid)
-            for token in args.get(pid, "").split()[:2]:
-                name = os.path.basename(token)
-                if name in ("claude", "codex"):
-                    return name, pid
+            tokens = args.get(pid, "").split()
+            names = [os.path.basename(t) for t in tokens[:2]]
+            if names and names[0] in ("claude", "codex"):
+                return names[0], pid
+            # The second token only counts behind an interpreter or launcher,
+            # so "less claude" or "ssh codex" is not an agent
+            if len(names) == 2 and names[1] in ("claude", "codex") and (
+                    names[0] in ("node", "bun", "deno", "bash", "sh", "zsh", "env", "npx")
+                    or re.match(r"python[0-9.]*$", names[0])):
+                return names[1], pid
             queue.extend(children.get(pid, []))
         return None, None
 
@@ -1882,7 +1904,7 @@ result = {
     "generated_at": iso(now),
     "sessions": selected,
 }
-json.dump(result, sys.stdout, ensure_ascii=False)
+sys.stdout.write(dumps_safe(result))
 sys.stdout.write("\n")
 ' "$1" "$2" "$3" "$4" "$CONFIG_DIR" "$STATE_DIR" "$STALE_AFTER"
 }
@@ -1972,7 +1994,7 @@ def resolve(view):
 
 def emit(agents):
     for agent in agents:
-        sys.stdout.write(json.dumps(agent, ensure_ascii=False) + "\n")
+        sys.stdout.write(dumps_safe(agent) + "\n")
     sys.stdout.flush()
 
 import math, shutil, signal
@@ -2297,8 +2319,8 @@ if notify:
 # Failures go to ~/.tmux-manager/notify.log, never to the hook.
 _cmd_notify() {
   command -v python3 &>/dev/null || return 0
-  exec python3 -I -S -c '
-import json, os, signal, socket, subprocess, sys, time
+  exec python3 -I -S -c "${_PY_STATE_LIB}${_PY_SNAPSHOT_LIB}"'
+import signal, socket
 
 log_path = sys.argv[1]
 cmd = os.environ.get("TM_NOTIFY_CMD")
@@ -2355,7 +2377,7 @@ except OSError as error:
     log("error: " + error.__class__.__name__)
     sys.exit(0)
 try:
-    child.communicate((json.dumps(agent, ensure_ascii=False) + "\n").encode(), timeout=5)
+    child.communicate((dumps_safe(agent) + "\n").encode(), timeout=5)
 except subprocess.TimeoutExpired:
     try:
         os.killpg(child.pid, signal.SIGKILL)

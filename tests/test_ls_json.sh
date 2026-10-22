@@ -238,7 +238,9 @@ test_filter_agent_recomputes_state() {
   local out; out=$("$TM" ls --json --agent codex)
   assert_eq '["codex"]' "$(json '[x["agent"] for x in d["sessions"][0]["agents"]]' <<< "$out")" only-codex
   assert_eq unknown "$(json 'd["sessions"][0]["state"]' <<< "$out")" recomputed
-  assert_eq '[]' "$("$TM" ls --json --agent nope | names)" no-match
+  assert_eq '[]' "$("$TM" ls --json --agent claude --state idle | names)" no-match
+  local code; "$TM" ls --json --agent nope >/dev/null 2>&1; code=$?
+  assert_eq 3 "$code" unknown-agent-type
 }
 
 test_filter_session() {
@@ -294,6 +296,52 @@ PY
   local out; out=$("$TM" ls --json)
   assert_eq '[null, null, null]' \
     "$(json '[d["sessions"][0]["agents"][0][k] for k in ("reason", "message", "session_id")]' <<< "$out")" nulls
+}
+
+test_program_with_agent_argument_is_not_agent() {
+  printf 'x\n' > "$TEST_TMP/claude"; printf 'x\n' > "$TEST_TMP/codex"
+  # ps shows "less claude": a pager is not an interpreter
+  tmux new-session -d -s a -c "$TEST_TMP" "less claude"
+  tmux new-session -d -s b -c "$TEST_TMP" "less codex"
+  sleep 0.5
+  assert_eq '[[], []]' "$("$TM" ls --json | json '[s["agents"] for s in d["sessions"]]')" not-agents
+}
+
+test_node_launched_agent_detected() {
+  # perl renamed to node runs the script and keeps argv as "node <path>/claude"
+  mkdir -p "$TEST_TMP/nodebin"
+  ln -s "$(command -v perl)" "$TEST_TMP/nodebin/node"
+  printf 'sleep 600;\n' > "$TEST_TMP/claude"
+  tmux new-session -d -s a -c "$TEST_TMP" "$TEST_TMP/nodebin/node $TEST_TMP/claude"
+  sleep 0.5
+  assert_eq claude "$("$TM" ls --json | json 'd["sessions"][0]["agents"][0]["agent"]')" node-claude
+}
+
+test_session_path_with_tab() {
+  mkdir -p "$TEST_TMP/wo"$'\t'"rk"
+  tmux new-session -d -s tabdir -c "$TEST_TMP/wo"$'\t'"rk" "sleep 600"
+  assert_eq "$TEST_TMP/wo"$'\t'"rk" "$("$TM" ls --json --session tabdir | json 'd["sessions"][0]["dir"]')" dir
+}
+
+test_state_value_not_globbed() {
+  new_session a
+  touch "$TEST_TMP/claude"
+  local err; err=$(cd "$TEST_TMP" && "$TM" ls --json --state '*' 2>&1 >/dev/null)
+  assert_contains "$err" "Invalid state: *" literal
+}
+
+test_c1_controls_escaped() {
+  agent_pane new a
+  set_state a blocked "{\"notification_type\":\"permission_prompt\",\"message\":\"x$(printf '\xc2\x9b')31my\"}"
+  local raw; raw=$("$TM" ls --json)
+  assert_not_contains "$raw" "$(printf '\xc2\x9b')" raw-c1
+  assert_contains "$raw" '\u009b' escaped
+}
+
+test_unknown_agent_type_exit_3() {
+  new_session a
+  local code; "$TM" ls --json --agent Claude >/dev/null 2>&1; code=$?
+  assert_eq 3 "$code" exit
 }
 
 run_tests
