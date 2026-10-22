@@ -215,4 +215,61 @@ test_claude_named_file_is_not_agent() {
   assert_eq '[]' "$("$TM" ls --json | json 'd["sessions"][0]["agents"]')" not-agent
 }
 
+# ─── Task 3: filters and exit codes ───────────────────
+
+names() { json '[s["name"] for s in d["sessions"]]'; }
+
+test_filter_state() {
+  new_session a; new_session b; new_session c
+  tmux split-window -d -t a "sleep 600"
+  set_state a:0.0 blocked; set_state a:0.1 idle; set_state b idle
+  assert_eq '["a"]' "$("$TM" ls --json --state blocked | names)" blocked
+  assert_eq '["a", "b"]' "$("$TM" ls --json --state=idle | names)" idle-equals-form
+  assert_eq '["a", "b"]' "$("$TM" ls --json --state blocked,idle | names)" csv
+  assert_eq 2 "$("$TM" ls --json --state blocked | json 'len(d["sessions"][0]["agents"])')" keeps-all-agents
+}
+
+test_filter_agent_recomputes_state() {
+  fake_agent codex
+  new_session a
+  tmux split-window -d -t a "$TEST_TMP/bin/codex"
+  sleep 0.3
+  set_state a:0.0 blocked
+  local out; out=$("$TM" ls --json --agent codex)
+  assert_eq '["codex"]' "$(json '[x["agent"] for x in d["sessions"][0]["agents"]]' <<< "$out")" only-codex
+  assert_eq unknown "$(json 'd["sessions"][0]["state"]' <<< "$out")" recomputed
+  assert_eq '[]' "$("$TM" ls --json --agent nope | names)" no-match
+}
+
+test_filter_session() {
+  new_session a; new_session b
+  assert_eq '["b"]' "$("$TM" ls --json --session b | names)" one
+  local code; "$TM" ls --json --session zz >/dev/null 2>&1; code=$?
+  assert_eq 2 "$code" missing-exit-2
+}
+
+test_empty_result_exit_0() {
+  new_session a
+  local out code; out=$("$TM" ls --json --state blocked); code=$?
+  assert_eq 0 "$code" exit
+  assert_eq '[]' "$(json 'd["sessions"]' <<< "$out")" empty
+}
+
+test_no_summary() {
+  new_session a
+  mkdir -p "$HOME/.tmux-manager/summaries"
+  echo '{"ts":1,"summary":"x"}' > "$HOME/.tmux-manager/summaries/a.jsonl"
+  assert_eq null "$("$TM" ls --json --no-summary | json 'd["sessions"][0]["summary"]')" null
+}
+
+test_bad_args_exit_3() {
+  new_session a
+  local args code
+  for args in "--bogus" "--json --state" "--json --state nope" "--json --agent" "--json --session" "--state blocked" "--no-summary"; do
+    # shellcheck disable=SC2086
+    "$TM" ls $args >/dev/null 2>&1; code=$?
+    assert_eq 3 "$code" "args <$args>"
+  done
+}
+
 run_tests

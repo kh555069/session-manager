@@ -1345,7 +1345,51 @@ _cmd_ls() {
     _cmd_simple_list
     return
   fi
-  _ls_json "" "" "" 0
+  local json=0 states="" agent="" session="" no_summary=0 filtered=0
+  local opt value s
+  while [[ $# -gt 0 ]]; do
+    opt="$1"; value=""
+    case "$opt" in
+      --state=*|--agent=*|--session=*) value="${opt#*=}"; opt="${opt%%=*}" ;;
+      --state|--agent|--session)
+        if [[ $# -lt 2 ]]; then
+          _ls_usage_error "${opt} needs a value"
+        fi
+        value="$2"; shift ;;
+    esac
+    case "$opt" in
+      --json)       json=1 ;;
+      --no-summary) no_summary=1; filtered=1 ;;
+      --state)      states="$value"; filtered=1 ;;
+      --agent)      agent="$value"; filtered=1 ;;
+      --session)    session="$value"; filtered=1 ;;
+      *)            _ls_usage_error "Unknown option: ${opt}" ;;
+    esac
+    case "$opt" in
+      --state|--agent|--session)
+        [[ -n "$value" ]] || _ls_usage_error "${opt} needs a value" ;;
+    esac
+    shift
+  done
+  if [[ $filtered -eq 1 && $json -eq 0 ]]; then
+    _ls_usage_error "Filters require --json"
+  fi
+  local IFS=','
+  for s in $states; do
+    case "$s" in
+      blocked|working|idle|unknown) ;;
+      *) _ls_usage_error "Invalid state: ${s} (blocked, working, idle, unknown)" ;;
+    esac
+  done
+  unset IFS
+  _ls_json "$states" "$agent" "$session" "$no_summary"
+}
+
+# Print a tm ls argument error to stderr and exit 3
+_ls_usage_error() {
+  echo -e "${C_RED}✗ $1${C_RESET}" >&2
+  echo "Usage: tm ls [--json [--state <s>[,<s>]] [--agent <name>] [--session <name>] [--no-summary]]" >&2
+  exit 3
 }
 
 # Print every session and its agent panes as one JSON object (schema v1).
@@ -1505,19 +1549,38 @@ for row in panes:
         "_order": (int(row["window_index"] or 0), int(row["pane_index"] or 0)),
     })
 
+if session_filter and session_filter not in sessions:
+    sys.stderr.write("✗ Session " + json.dumps(session_filter, ensure_ascii=False) + " not found\n")
+    sys.exit(2)
+
+wanted_states = set(s for s in states_csv.split(",") if s)
 rank = {"unknown": 0, "idle": 1, "working": 2, "blocked": 3}
-for session in sessions.values():
+selected = []
+for name in sorted(sessions):
+    session = sessions[name]
+    if session_filter and name != session_filter:
+        continue
     session["agents"].sort(key=lambda agent: agent["_order"])
     for agent in session["agents"]:
         del agent["_order"]
+    # --agent drops other agents and recomputes the session state from the rest
+    if agent_filter:
+        session["agents"] = [a for a in session["agents"] if a["agent"] == agent_filter]
+        if not session["agents"]:
+            continue
+    for agent in session["agents"]:
         if rank[agent["state"]] > rank[session["state"]]:
             session["state"] = agent["state"]
+    # --state keeps the whole session when any agent matches
+    if wanted_states and not any(a["state"] in wanted_states for a in session["agents"]):
+        continue
+    selected.append(session)
 
 result = {
     "v": 1,
     "host": socket.gethostname().split(".")[0] or None,
     "generated_at": iso(now),
-    "sessions": [sessions[name] for name in sorted(sessions)],
+    "sessions": selected,
 }
 json.dump(result, sys.stdout, ensure_ascii=False)
 sys.stdout.write("\n")
