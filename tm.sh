@@ -1015,6 +1015,46 @@ _attach_session() {
 
 # ─── 8. Main Interface (fzf) ─────────────────────────
 
+# Session list in fzf with the main menu keys; prints the selected lines.
+# Shared by the main menu and tm dash. Args: BORDER_LABEL [extra fzf args...]
+_fzf_menu() {
+  local label="$1"; shift
+  # Adapt fzf header and column display for narrow terminals
+  local fzf_header fzf_with_nth
+  if _is_narrow; then
+    fzf_header="↵Go Tab^Sel ^NNew ^KKill ^ERen ^DDtch ^PLock ^RRef Esc"
+    fzf_with_nth="1,2,3,4,5"
+  else
+    fzf_header="Keys: ↵Enter │ Tab Multi-sel │ ^N New │ ^K Kill │ ^E Rename │ ^D Detach │ ^P Protect │ ^R Refresh │ ^Q Quit"
+    fzf_with_nth="1,2,3,4,5,6"
+  fi
+
+  "$SELF" _list \
+    | "$FZF" \
+        --ansi --multi --reverse --exact \
+        --border=rounded \
+        --border-label="$label" \
+        --header="$fzf_header" \
+        --header-first \
+        --header-lines=1 \
+        --delimiter=$'\t' \
+        --with-nth="$fzf_with_nth" \
+        --preview="$SELF _preview {2}" \
+        --preview-window="down:50%:wrap" \
+        --bind="tab:toggle+down" \
+        --bind="ctrl-n:execute($SELF _create </dev/tty >/dev/tty)+reload($SELF _list)" \
+        --bind="ctrl-k:execute($SELF _kill-selected {+2} </dev/tty >/dev/tty)+reload($SELF _list)" \
+        --bind="ctrl-e:execute($SELF _rename {2} </dev/tty >/dev/tty)+reload($SELF _list)" \
+        --bind="ctrl-d:execute($SELF _detach-others {2} </dev/tty >/dev/tty)+reload($SELF _list)" \
+        --bind="ctrl-p:execute-silent($SELF _toggle-protect {2})+reload($SELF _list)" \
+        --bind="ctrl-r:reload($SELF _list)" \
+        --bind="ctrl-q:abort" \
+        --color="bg+:#283457,fg:#c0caf5,fg+:#c0caf5,hl:#ff9e64,hl+:#ff9e64" \
+        --color="header:#565f89,info:#7aa2f7,pointer:#7dcfff,marker:#9ece6a" \
+        --color="prompt:#7aa2f7,spinner:#9ece6a,border:#3b4261,label:#7aa2f7" \
+        "$@"
+}
+
 _cmd_main() {
   _check_deps
 
@@ -1042,43 +1082,8 @@ _cmd_main() {
       break
     fi
 
-    # Adapt fzf header and column display for narrow terminals
-    local fzf_header fzf_with_nth
-    if _is_narrow; then
-      fzf_header="↵Go Tab^Sel ^NNew ^KKill ^ERen ^DDtch ^PLock ^RRef Esc"
-      fzf_with_nth="1,2,3,4,5"
-    else
-      fzf_header="Keys: ↵Enter │ Tab Multi-sel │ ^N New │ ^K Kill │ ^E Rename │ ^D Detach │ ^P Protect │ ^R Refresh │ ^Q Quit"
-      fzf_with_nth="1,2,3,4,5,6"
-    fi
-
     local selected
-    selected=$(
-      "$SELF" _list \
-        | "$FZF" \
-            --ansi --multi --reverse --exact \
-            --border=rounded \
-            --border-label=" tmux session manager v${VERSION} " \
-            --header="$fzf_header" \
-            --header-first \
-            --header-lines=1 \
-            --delimiter=$'\t' \
-            --with-nth="$fzf_with_nth" \
-            --preview="$SELF _preview {2}" \
-            --preview-window="down:50%:wrap" \
-            --bind="tab:toggle+down" \
-            --bind="ctrl-n:execute($SELF _create </dev/tty >/dev/tty)+reload($SELF _list)" \
-            --bind="ctrl-k:execute($SELF _kill-selected {+2} </dev/tty >/dev/tty)+reload($SELF _list)" \
-            --bind="ctrl-e:execute($SELF _rename {2} </dev/tty >/dev/tty)+reload($SELF _list)" \
-            --bind="ctrl-d:execute($SELF _detach-others {2} </dev/tty >/dev/tty)+reload($SELF _list)" \
-            --bind="ctrl-p:execute-silent($SELF _toggle-protect {2})+reload($SELF _list)" \
-            --bind="ctrl-r:reload($SELF _list)" \
-            --bind="ctrl-q:abort" \
-            --color="bg+:#283457,fg:#c0caf5,fg+:#c0caf5,hl:#ff9e64,hl+:#ff9e64" \
-            --color="header:#565f89,info:#7aa2f7,pointer:#7dcfff,marker:#9ece6a" \
-            --color="prompt:#7aa2f7,spinner:#9ece6a,border:#3b4261,label:#7aa2f7" \
-        || true
-    )
+    selected=$(_fzf_menu " tmux session manager v${VERSION} " || true)
 
     # Esc / Ctrl-Q → empty selection → exit tm.sh
     if [[ -z "$selected" ]]; then
@@ -1095,6 +1100,135 @@ _cmd_main() {
       _attach_session "$session_name"
     fi
   done
+}
+
+# tm dash [--popup]: the main menu list, reloaded whenever agent states change.
+# --popup: after Enter, switch to the session and exit (closes a tmux popup).
+_cmd_dash() {
+  local popup=0
+  case "${1:-}" in
+    --popup) popup=1 ;;
+    "") ;;
+    *) echo "Usage: tm dash [--popup]" >&2; exit 3 ;;
+  esac
+  if ! _has_tmux_server; then
+    echo -e "${C_YELLOW}No tmux sessions found.${C_RESET}"
+    return
+  fi
+
+  # fzf actions over this socket run commands, so it lives in a private dir
+  local run_dir="${CONFIG_DIR}/run"
+  mkdir -p "$run_dir" && chmod 700 "$run_dir"
+  _DASH_SOCK="${run_dir}/dash-$$.sock"
+  _DASH_OUT="${run_dir}/dash-$$.out"
+  _DASH_WATCHER=""
+  _DASH_FZF=""
+  trap '_dash_cleanup' EXIT
+  # bash defers traps while a foreground command runs, so fzf runs in the
+  # background and `wait` (which a trapped signal interrupts) waits for it
+  trap '_dash_abort; exit 130' INT
+  trap '_dash_abort; exit 143' TERM
+  trap '_dash_abort; exit 129' HUP
+
+  local selected first_line session_name _skip
+  while _has_tmux_server; do
+    "$SELF" _dash-watch "$_DASH_SOCK" "$$" &
+    _DASH_WATCHER=$!
+    ( umask 077; : > "$_DASH_OUT" )
+    _fzf_menu " tm dash " --listen="$_DASH_SOCK" > "$_DASH_OUT" &
+    _DASH_FZF=$!
+    wait "$_DASH_FZF" || true  # fzf exits non-zero on Esc or no match
+    _DASH_FZF=""
+    _dash_stop_watcher
+    selected=$(<"$_DASH_OUT")
+    [[ -z "$selected" ]] && break
+
+    first_line="${selected%%$'\n'*}"
+    IFS=$'\t' read -r _skip session_name _skip <<< "$first_line"
+    _parse_name "$session_name"
+    # A failed switch (session just closed) must not end a long-running dash
+    if [[ -n "$_PARSED" ]]; then
+      _attach_session "$_PARSED" || true
+    fi
+    [[ $popup -eq 1 ]] && break
+  done
+}
+
+_dash_stop_watcher() {
+  if [[ -n "$_DASH_WATCHER" ]]; then
+    kill "$_DASH_WATCHER" 2>/dev/null
+    wait "$_DASH_WATCHER" 2>/dev/null
+    _DASH_WATCHER=""
+  fi
+}
+
+# Ask the running fzf to quit (dash got a signal) and wait for it
+_dash_abort() {
+  if [[ -n "$_DASH_FZF" ]]; then
+    curl -s --max-time 2 --unix-socket "$_DASH_SOCK" -XPOST http://localhost -d "abort" >/dev/null 2>&1
+    wait "$_DASH_FZF" 2>/dev/null
+    _DASH_FZF=""
+  fi
+}
+
+# Remove only what this dash created; fzf removes its socket on a normal exit
+_dash_cleanup() {
+  _dash_stop_watcher
+  [[ -S "$_DASH_SOCK" ]] && rm -f "$_DASH_SOCK"
+  [[ -f "$_DASH_OUT" ]] && rm -f "$_DASH_OUT"
+}
+
+# Background loop of tm dash: after each state file change (inotifywait) or
+# every 2 s, ask fzf to reload. Ends when fzf is gone; when the dash process
+# itself is gone (e.g. killed by SIGTERM while fzf runs) it aborts fzf first.
+# Args: SOCKET DASH_PID
+_dash_watch() {
+  local sock="$1" dash_pid="$2" child="" i
+  local inotify; inotify=$(command -v inotifywait || true)
+  trap '[[ -n "$child" ]] && kill "$child" 2>/dev/null; exit 0' TERM INT HUP
+
+  for i in $(seq 50); do
+    [[ -S "$sock" ]] && break
+    sleep 0.1
+  done
+  while true; do
+    if [[ -n "$inotify" && -d "$STATE_DIR" ]]; then
+      "$inotify" -qq -t 5 -e close_write,moved_to,create,delete "$STATE_DIR" >/dev/null 2>&1 &
+    else
+      sleep 2 &
+    fi
+    child=$!
+    wait "$child"
+    child=""
+    if ! kill -0 "$dash_pid" 2>/dev/null; then
+      curl -s --max-time 2 --unix-socket "$sock" -XPOST http://localhost -d "abort" >/dev/null 2>&1
+      exit 0
+    fi
+    curl -s --max-time 2 --unix-socket "$sock" -XPOST http://localhost \
+      -d "transform:$SELF _dash-reload {2}" >/dev/null 2>&1 || exit 0
+  done
+}
+
+# fzf action that reloads the list and keeps the cursor on session NAME
+_cmd_dash_reload() {
+  _parse_name "${1:-}"
+  local name="$_PARSED" list n=0 pos=0 line _skip field
+  list=$("$SELF" _list)
+  while IFS= read -r line; do
+    n=$((n + 1))
+    [[ $n -eq 1 ]] && continue  # header line
+    IFS=$'\t' read -r _skip field _skip <<< "$line"
+    _parse_name "$field"
+    if [[ -n "$name" && "$_PARSED" == "$name" ]]; then
+      pos=$((n - 1))
+      break
+    fi
+  done <<< "$list"
+  if [[ $pos -gt 0 ]]; then
+    echo "reload-sync($SELF _list)+pos($pos)"
+  else
+    echo "reload-sync($SELF _list)"
+  fi
 }
 
 # Switch to last session
@@ -3020,6 +3154,9 @@ case "${1:-}" in
   ls|list)         _check_cmd tmux; _cmd_ls "${@:2}" ;;
   wait)            _check_cmd tmux; _cmd_wait "${@:2}" ;;
   state-count)     _cmd_state_count "${@:2}" ;;
+  dash)            _check_deps; _check_cmd curl; _cmd_dash "${@:2}" ;;
+  _dash-watch)     _dash_watch "${2:-}" "${3:-}" ;;
+  _dash-reload)    _cmd_dash_reload "${2:-}" ;;
   rename)          _check_cmd tmux; _cmd_rename "${2:-}" ;;
   last)            _check_cmd tmux; _cmd_last ;;
   templates|tpl)   _cmd_templates ;;

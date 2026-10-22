@@ -19,6 +19,8 @@ setup_env() {
   mkdir -p "$HOME" "$TMUX_TMPDIR" "$TEST_TMP/bin"
   cp "$REPO_ROOT/tm.sh" "$TEST_TMP/bin/tm.sh"
   chmod +x "$TEST_TMP/bin/tm.sh"
+  # tm looks for fzf next to itself (tm dash needs it)
+  [[ -x "$REPO_ROOT/fzf" ]] && ln -s "$REPO_ROOT/fzf" "$TEST_TMP/bin/fzf"
   TM="$TEST_TMP/bin/tm.sh"
   STATE_DIR="$HOME/.tmux-manager/state"
 }
