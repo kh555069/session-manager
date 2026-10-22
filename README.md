@@ -206,7 +206,7 @@ cp completions/tm.zsh ~/.zsh/completions/_tm
 
 ## Agent State
 
-After `tm install-claude-hook`, Claude Code hooks report each agent's state, and the menu shows it next to the session status:
+After `tm install-claude-hook`, Claude Code hooks report each agent's state, and the menu shows it next to the session status. Running it again after moving tm.sh (for example after removing a worktree) points the existing tm hooks at the new path; other hooks are left alone.
 
 | Icon | State | Meaning |
 |------|-------|---------|
@@ -246,7 +246,7 @@ After `tm install-claude-hook`, Claude Code hooks report each agent's state, and
 | Option | Effect |
 |--------|--------|
 | `--state <s>[,<s>]` | Keep sessions with at least one agent in these states (`blocked`, `working`, `idle`, `unknown`) |
-| `--agent <name>` | Keep only agents of this type (`claude`, `codex`); session `state` is recomputed from them |
+| `--agent <name>` | Keep only agents of this type, `claude` or `codex` (other values are an argument error); session `state` is recomputed from them |
 | `--session <name>` | Only this session |
 | `--no-summary` | Skip reading AI summaries (`summary` is `null`) |
 
@@ -294,7 +294,9 @@ tm wait <target>|--all --until idle|blocked|done|dead [--timeout 30m] [--interva
 | `1` | Timed out |
 | `2` | The target does not exist, or an agent died while waiting (except with `--until dead`) |
 | `3` | Invalid arguments |
+| `5` | Internal error (reported on stderr); not a timeout |
 | `130` | Interrupted (Ctrl-C) |
+| `143` | Terminated (SIGTERM) |
 
 On return, stdout has one JSON object per agent, in the same format as `tm ls --json` `agents[]`: the agents that met the condition, the ones that died (`state: "dead"`), or, on timeout, the current state of every agent.
 
@@ -371,7 +373,7 @@ Three more ways to see agent states, all reading the same state files: `tm dash`
 
 ### `tm dash`
 
-The main menu list with the same keys, but it refreshes itself: it checks whenever a state file changes (with `inotifywait`) or every 2 seconds otherwise, and reloads only when the list actually changed. The cursor stays on the session it was on, even when a blocked session moves to the top or a search query is typed. While sessions are Tab-selected it does not reload, so the selection is kept. The preview shows the last 15 screen lines of every blocked pane, so you can see what it is asking without attaching.
+The main menu list with the same keys, but it refreshes itself: it checks whenever a state file changes (with `inotifywait`) or every 2 seconds otherwise, and reloads only when the list actually changed. The cursor stays on the session it was on, even when a blocked session moves to the top or a search query is typed. While sessions are Tab-selected it does not reload, so the selection is kept. The preview shows the last 15 screen lines of every blocked pane (trailing blank lines dropped), so you can see what it is asking without attaching.
 
 ```
 # ~/.tmux.conf

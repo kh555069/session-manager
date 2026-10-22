@@ -1339,7 +1339,8 @@ ${C_BOLD}Usage:${C_RESET}
                         (exit 2: no such session, 3: bad arguments, 4: no tmux server)
   tm wait <target>|--all --until idle|blocked|done|dead [--timeout 30m] [--interval 2]
           [--match any|all] [--after-change]
-                        Block until agents reach a state (exit 1: timeout, 2: gone/dead, 3: bad arguments)
+                        Block until agents reach a state (exit 1: timeout, 2: gone/dead,
+                        3: bad arguments, 5: internal error, 130: SIGINT, 143: SIGTERM)
   tm dash [--popup]     Session list that refreshes when agent states change
                         (--popup: exit after switching, for tmux display-popup)
   tm state-count [--format tmux|plain]

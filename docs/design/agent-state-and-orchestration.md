@@ -364,9 +364,19 @@ Notification 的 `message` 可能含指令內容或路徑，送到外部服務�
 - **dash 的控制通道**：fzf `--listen=<Unix socket>`，放在 `~/.tmux-manager/run/`（0700），因為 `reload(...)` 會執行指令，TCP port 任何本機使用者都能連。監看迴圈送出 `transform:tm _dash-reload {2} <dash pid>`，回傳 `reload-sync(cat run/dash-<pid>.list)+pos(n)` 讓游標留在原本的 session：fzf 載入的正是算位置時用的那份列表；有搜尋字串時，位置改用 `fzf --filter` 套同樣的條件計算；列表沒變或有 Tab 選取時不回傳任何 action（不重新載入）；`transform(...)` 的括號寫法會在內層第一個 `)` 截斷，所以用冒號寫法。
 - **dash 的結束**：bash 在前景指令執行時會延後處理 trap，所以 fzf 在背景執行、bash 以 `wait` 等待；TERM、HUP 時透過 socket 送 `abort`；SIGINT 只會在 `execute()` 提示中按 Ctrl-C 時出現，與主選單一樣只取消提示，dash 忽略它並繼續等 fzf。所有 `wait` 都容許非 0（`inotifywait` 逾時回 2），否則 `set -e` 會讓 dash 結束。監看迴圈在 dash 行程消失時也會 abort fzf 並結束。fzf 的輸出寫到 `run/dash-<pid>.out`、列表快取寫到 `run/dash-<pid>.list`，結束時與殘留的 socket 一起移除。
 - **popup**：tmux 無法可靠判斷程式是否在 popup 內，改用 `tm dash --popup`：Enter 後 switch-client 並結束。
-- **preview**：主選單與 dash 共用；blocked pane 顯示最後 15 個非空白行，並移除控制字元。
+- **preview**：主選單與 dash 共用；blocked pane 顯示去掉結尾空白行後的最後 15 行，並移除控制字元。
 - **推播的轉換**：舊狀態存在且不同才算轉換；`idle` 只在舊狀態為 `working` 時通知。頻率限制記在狀態檔新增的 `notified_at`。
 - **推播的執行**：hook 寫完狀態檔後以 `start_new_session` 啟動 `tm _notify`，hook 不等待；`_notify` 用一次 `tmux display-message` 補上 `target` 與 `tmux_session`，`pid` 為 `null`。指令在自己的 process group 執行，逾時 5 秒整組終止。只有失敗寫 log（時間、pane、狀態、結果，不含 message）。沒有設定 `TM_NOTIFY_CMD` 時 hook 延遲 36 ms。
+
+### PR 5 決定（延後 Minor 清理）
+
+- **狀態檔健壯性**：`load_state` 攔下 `RecursionError`；`reason`、`message`、`session_id`、`agent` 不是字串時視為 `null`。`tm save` 一併清掉超過 60 秒的 `*.json.*.tmp`。`hook-state` 在 `_init` 之前 route，HOME 無法寫入時仍 exit 0。
+- **Agent 偵測**：第 2 個 token 只在第 1 個是直譯器或啟動器（`node`、`bun`、`deno`、`bash`、`sh`、`zsh`、`env`、`npx`、`python*`）時才算，`less claude`、`ssh codex` 不再誤判。
+- **`tm ls --json`**：`session_path` 放在 tmux 欄位最後，含 tab 的路徑不會讓 session 消失；`--state` 不做萬用字元展開；`--agent` 只接受 `claude`、`codex`；JSON 輸出（含 `tm wait` 與推播）把 U+0080–U+009F 跳脫成 `\u00XX`。
+- **`tm wait`**：`--until dead` 印出等待期間所有結束的 agent；`--timeout` 給了就不能是空值，數字最多 7 位；未預期的例外 exit 5；啟動 `inotifywait` 前後擋住 SIGINT、SIGTERM，子行程在 exec 前解除。
+- **fzf 相關**：fzf action 一律使用 `printf %q` 跳脫過的 tm.sh 路徑（路徑含 `)` 仍不支援，fzf 會在第一個 `)` 結束 action）；dash 啟動時清掉 pid 已不存在或不是 `tm dash` 的 `run/dash-<pid>.*`；`state-count` 以 pane id 去重、`--format` 缺值時 exit 3；preview 所有帶外部文字的行改用 `printf %s`。
+- **安裝器**：第 1 個字是 `tm.sh` 或 `tm`、其餘與 suffix 完全相同的 hook 才算 tm 的 hook；路徑不同時改成目前的路徑並列在 `Updated` 區塊，使用者自己的 hook 不動。
+- **不修**：`join-pane` 後短暫 `unknown`（tmux 沒有 pane 建立時間可比對）、`_session_agent_state` 的 O(n²)（30 個 session 時不到 1 ms）、「Enter 選取 session」的自動化測試（需要真的 tmux client，手動測試 14-7 涵蓋）。
 
 ## 實作順序與待確認問題
 

@@ -207,7 +207,7 @@ cp completions/tm.zsh ~/.zsh/completions/_tm
 
 ## Agent 狀態
 
-執行 `tm install-claude-hook` 後，Claude Code hooks 會回報每個 agent 的狀態，選單在 session 狀態旁顯示：
+執行 `tm install-claude-hook` 後，Claude Code hooks 會回報每個 agent 的狀態，選單在 session 狀態旁顯示。搬動 tm.sh 之後（例如移除 worktree）再執行一次，會把既有的 tm hook 改指向新路徑；其他 hook 不受影響。
 
 | 圖示 | 狀態 | 意義 |
 |------|------|------|
@@ -247,7 +247,7 @@ cp completions/tm.zsh ~/.zsh/completions/_tm
 | 參數 | 作用 |
 |------|------|
 | `--state <s>[,<s>]` | 只留下至少有一個 agent 處於這些狀態的 session（`blocked`、`working`、`idle`、`unknown`） |
-| `--agent <name>` | 只留下指定類型的 agent（`claude`、`codex`），session 的 `state` 依剩下的 agent 重算 |
+| `--agent <name>` | 只留下指定類型的 agent，只接受 `claude`、`codex`（其他值視為參數錯誤），session 的 `state` 依剩下的 agent 重算 |
 | `--session <name>` | 只輸出這個 session |
 | `--no-summary` | 不讀 AI 摘要（`summary` 為 `null`） |
 
@@ -295,7 +295,9 @@ tm wait <target>|--all --until idle|blocked|done|dead [--timeout 30m] [--interva
 | `1` | 逾時 |
 | `2` | target 不存在，或等待期間有 agent 結束（`--until dead` 除外） |
 | `3` | 參數錯誤 |
+| `5` | 內部錯誤（訊息寫在 stderr），不是逾時 |
 | `130` | 被中斷（Ctrl-C） |
+| `143` | 被終止（SIGTERM） |
 
 返回時 stdout 每行一個 JSON 物件，格式與 `tm ls --json` 的 `agents[]` 相同。依返回原因，內容是達成條件的 agent、已結束的 agent（`state: "dead"`），或逾時時每個 agent 目前的狀態。
 
@@ -372,7 +374,7 @@ tm wait --all --until done --after-change --match any
 
 ### `tm dash`
 
-與主選單相同的列表與快捷鍵，但會自動更新：狀態檔一變更就檢查（需要 `inotifywait`），否則每 2 秒檢查一次，列表內容真的有變才重新載入。即使有 session 變成 blocked 被排到最上面，或正在輸入搜尋字串，游標也會停在原本的 session。有 session 被 Tab 選取時不會重新載入，選取不會消失。Preview 會顯示每個 blocked pane 最後 15 行畫面，不用 attach 就能看到它在問什麼。
+與主選單相同的列表與快捷鍵，但會自動更新：狀態檔一變更就檢查（需要 `inotifywait`），否則每 2 秒檢查一次，列表內容真的有變才重新載入。即使有 session 變成 blocked 被排到最上面，或正在輸入搜尋字串，游標也會停在原本的 session。有 session 被 Tab 選取時不會重新載入，選取不會消失。Preview 會顯示每個 blocked pane 最後 15 行畫面（去掉結尾的空白行），不用 attach 就能看到它在問什麼。
 
 ```
 # ~/.tmux.conf

@@ -47,7 +47,7 @@ bash tests/run.sh
 | 步驟 | 操作 | 預期 |
 |------|------|------|
 | 4-1 | 請 Claude 做一件需要核准的事，例如「用 Bash 執行 `touch /tmp/tm-test`」，先**不要**回答權限畫面 | 列表顯示 `❓`，`state-test` 排到最上面 |
-| 4-2 | 在選單中移到 `state-test` 看 preview | 出現 `── Agents ──` 區塊，有一行 `blocked (permission)`，下一行是通知文字（例如 `Claude needs your permission to use Bash`），再下面是該 pane 最後 15 行畫面，看得到權限選項 |
+| 4-2 | 在選單中移到 `state-test` 看 preview | 出現 `── Agents ──` 區塊，有一行 `blocked (permission)`，下一行是通知文字（例如 `Claude needs your permission to use Bash`），再下面是該 pane 最後 15 行畫面（去掉結尾的空白行），看得到權限選項 |
 | 4-3 | 核准權限 | 工具執行時回到 `⏳`，做完變 `💤` |
 | 4-4 | 再請它做一次需要核准的事，這次**拒絕**或按 Esc | `❓` 會留到下一個 prompt（已知限制：Claude 沒有可偵測拒絕或中斷的 hook） |
 
@@ -90,7 +90,7 @@ bash tests/run.sh
 cp ~/.claude/settings.json.tm-backup-<時間> ~/.claude/settings.json
 ```
 
-hook 指向安裝當下 `tm.sh` 的絕對路徑。如果是在 worktree 安裝，移除 worktree 後 hook 會找不到檔案；屆時在新位置重跑 `install-claude-hook`，並刪掉 `settings.json` 中指向舊路徑的 hook（安裝器目前只比對指令結尾，不會自動替換舊路徑）。
+hook 指向安裝當下 `tm.sh` 的絕對路徑。如果是在 worktree 安裝，移除 worktree 後 hook 會找不到檔案；屆時在新位置重跑 `install-claude-hook`，它會把指向舊路徑的 tm hook 改成新路徑，並在輸出的 `Updated to <路徑>` 區塊列出。
 
 ## 10. Subagent 會不會蓋掉主 agent 的狀態
 
