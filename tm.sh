@@ -1395,20 +1395,11 @@ _ls_usage_error() {
   exit 3
 }
 
-# Print every session and its agent panes as one JSON object (schema v1).
-# Args: STATES_CSV AGENT SESSION NO_SUMMARY(0|1); empty strings mean no filter.
-# Exit: 0 ok (also when empty), 2 session not found, 4 no tmux server.
-_ls_json() {
-  if ! command -v python3 &>/dev/null; then
-    echo -e "${C_RED}✗ python3 is required for --json${C_RESET}" >&2
-    exit 1
-  fi
-  python3 -I -S -c "${_PY_STATE_LIB}"'
-import socket, subprocess
-
-states_csv, agent_filter, session_filter, no_summary, config_dir, state_dir, stale_after = sys.argv[1:8]
-stale_after = int(stale_after)
-now = time.time()
+# Python helpers that build one view of all sessions and agent panes from a
+# single tmux and a single ps call; shared by `tm ls --json` and `tm wait`.
+# Use after _PY_STATE_LIB. Must not contain single quotes.
+readonly _PY_SNAPSHOT_LIB='
+import subprocess
 
 def iso(value):
     if value is None:
@@ -1447,7 +1438,7 @@ def git_branch(path):
         current = parent
     return None
 
-def last_summary(name):
+def last_summary(config_dir, name):
     try:
         with open(os.path.join(config_dir, "summaries", name + ".jsonl")) as f:
             lines = [line for line in f if line.strip()]
@@ -1458,127 +1449,164 @@ def last_summary(name):
         return record["summary"]
     return None
 
-fields = ["session_name", "session_created", "session_path", "session_windows",
-          "session_attached", "session_activity", "window_index", "pane_index",
-          "pane_id", "pane_pid"]
-fmt = "\t".join("#{" + f + "}" for f in fields)
-listing = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt],
-                         capture_output=True, text=True)
-if listing.returncode != 0:
+def aggregate(agents):
+    """Session state from its agents: blocked > working > idle > unknown."""
+    rank = {"unknown": 0, "idle": 1, "working": 2, "blocked": 3}
+    state = "unknown"
+    for agent in agents:
+        if rank[agent["state"]] > rank[state]:
+            state = agent["state"]
+    return state
+
+def snapshot(config_dir, state_dir, stale_after, now, summary=True, git=True):
+    """(sessions, panes) for the running tmux server, or None without one.
+
+    sessions: name -> session dict with agents sorted by window and pane;
+    its "state" is left "unknown" for the caller to aggregate.
+    panes: every pane in tmux order as {session, window, pane, target}.
+    """
+    fields = ["session_name", "session_created", "session_path", "session_windows",
+              "session_attached", "session_activity", "window_index", "pane_index",
+              "pane_id", "pane_pid"]
+    fmt = "\t".join("#{" + f + "}" for f in fields)
+    listing = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt],
+                             capture_output=True, text=True)
+    if listing.returncode != 0:
+        return None
+
+    try:
+        with open(os.path.join(config_dir, "protected.txt")) as f:
+            protected = set(line.rstrip("\n") for line in f)
+    except OSError:
+        protected = set()
+
+    sessions, panes, rows = {}, [], []
+    for line in listing.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != len(fields):
+            continue
+        row = dict(zip(fields, parts))
+        name = row["session_name"]
+        if name not in sessions:
+            sessions[name] = {
+                "name": name,
+                "dir": row["session_path"] or None,
+                "git_branch": git_branch(row["session_path"]) if git and row["session_path"] else None,
+                "windows": int(row["session_windows"] or 0),
+                "panes": 0,
+                "clients": int(row["session_attached"] or 0),
+                "last_activity": iso(row["session_activity"]) if row["session_activity"].isdigit() else None,
+                "protected": name in protected,
+                "summary": last_summary(config_dir, name) if summary else None,
+                "state": "unknown",
+                "agents": [],
+            }
+        sessions[name]["panes"] += 1
+        rows.append(row)
+        panes.append({"session": name, "window": row["window_index"], "pane": row["pane_id"],
+                      "target": name + ":" + row["window_index"] + "." + row["pane_index"]})
+
+    # One ps call for the whole process tree
+    children, args = {}, {}
+    ps = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "args="],
+                        capture_output=True, text=True)
+    for line in ps.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        pid, ppid = int(parts[0]), int(parts[1])
+        children.setdefault(ppid, []).append(pid)
+        args[pid] = parts[2] if len(parts) == 3 else ""
+
+    def detect_agent(root):
+        # BFS from the pane shell; an agent is a process whose first or second
+        # argv token is named claude/codex (direct run, or node/bash running it)
+        queue, seen = [root], set()
+        while queue:
+            pid = queue.pop(0)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            for token in args.get(pid, "").split()[:2]:
+                name = os.path.basename(token)
+                if name in ("claude", "codex"):
+                    return name, pid
+            queue.extend(children.get(pid, []))
+        return None, None
+
+    for row in rows:
+        session = sessions[row["session_name"]]
+        root = int(row["pane_pid"]) if row["pane_pid"].isdigit() else None
+        found, pid = detect_agent(root) if root is not None else (None, None)
+        loaded = load_state(state_dir, row["pane_id"], row["session_created"], now, stale_after)
+        if loaded is not None and loaded["state"] == "unknown":
+            loaded = None  # dead record: describes an earlier agent, not the one running now
+        if loaded is None and found is None:
+            continue
+        record = loaded["record"] if loaded else {}
+        recorded_agent = record.get("agent")
+        if not (isinstance(recorded_agent, str) and recorded_agent):
+            recorded_agent = None
+        # Without a live agent process the hook state is unconfirmed (e.g. killed
+        # without SessionEnd), so it is never reported as idle/blocked/working
+        confirmed = loaded is not None and found is not None
+        session["agents"].append({
+            "pane": row["pane_id"],
+            "target": row["session_name"] + ":" + row["window_index"] + "." + row["pane_index"],
+            "agent": found or recorded_agent,
+            "pid": pid,
+            "session_id": record.get("session_id") if loaded else None,
+            "state": loaded["state"] if confirmed else "unknown",
+            "stale": loaded["stale"] if confirmed else False,
+            "since": iso(loaded["since"]) if loaded else None,
+            "reason": record.get("reason") if loaded else None,
+            "message": record.get("message") if loaded else None,
+            "source": "hook" if loaded else "heuristic",
+            "_order": (int(row["window_index"] or 0), int(row["pane_index"] or 0)),
+        })
+
+    for session in sessions.values():
+        session["agents"].sort(key=lambda agent: agent["_order"])
+        for agent in session["agents"]:
+            del agent["_order"]
+    return sessions, panes
+'
+
+# Print every session and its agent panes as one JSON object (schema v1).
+# Args: STATES_CSV AGENT SESSION NO_SUMMARY(0|1); empty strings mean no filter.
+# Exit: 0 ok (also when empty), 2 session not found, 4 no tmux server.
+_ls_json() {
+  if ! command -v python3 &>/dev/null; then
+    echo -e "${C_RED}✗ python3 is required for --json${C_RESET}" >&2
+    exit 1
+  fi
+  python3 -I -S -c "${_PY_STATE_LIB}${_PY_SNAPSHOT_LIB}"'
+import socket
+
+states_csv, agent_filter, session_filter, no_summary, config_dir, state_dir, stale_after = sys.argv[1:8]
+now = time.time()
+view = snapshot(config_dir, state_dir, int(stale_after), now, summary=no_summary != "1")
+if view is None:
     sys.stderr.write("✗ tmux server is not running\n")
     sys.exit(4)
-
-try:
-    with open(os.path.join(config_dir, "protected.txt")) as f:
-        protected = set(line.rstrip("\n") for line in f)
-except OSError:
-    protected = set()
-
-sessions, panes = {}, []
-for line in listing.stdout.splitlines():
-    parts = line.split("\t")
-    if len(parts) != len(fields):
-        continue
-    row = dict(zip(fields, parts))
-    name = row["session_name"]
-    if name not in sessions:
-        sessions[name] = {
-            "name": name,
-            "dir": row["session_path"] or None,
-            "git_branch": git_branch(row["session_path"]) if row["session_path"] else None,
-            "windows": int(row["session_windows"] or 0),
-            "panes": 0,
-            "clients": int(row["session_attached"] or 0),
-            "last_activity": iso(row["session_activity"]) if row["session_activity"].isdigit() else None,
-            "protected": name in protected,
-            "summary": None if no_summary == "1" else last_summary(name),
-            "state": "unknown",
-            "agents": [],
-        }
-    sessions[name]["panes"] += 1
-    panes.append(row)
-
-# One ps call for the whole process tree
-children, args = {}, {}
-ps = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "args="],
-                    capture_output=True, text=True)
-for line in ps.stdout.splitlines():
-    parts = line.split(None, 2)
-    if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
-        continue
-    pid, ppid = int(parts[0]), int(parts[1])
-    children.setdefault(ppid, []).append(pid)
-    args[pid] = parts[2] if len(parts) == 3 else ""
-
-def detect_agent(root):
-    # BFS from the pane shell; an agent is a process whose first or second
-    # argv token is named claude/codex (direct run, or node/bash running it)
-    queue, seen = [root], set()
-    while queue:
-        pid = queue.pop(0)
-        if pid in seen:
-            continue
-        seen.add(pid)
-        for token in args.get(pid, "").split()[:2]:
-            name = os.path.basename(token)
-            if name in ("claude", "codex"):
-                return name, pid
-        queue.extend(children.get(pid, []))
-    return None, None
-
-for row in panes:
-    session = sessions[row["session_name"]]
-    root = int(row["pane_pid"]) if row["pane_pid"].isdigit() else None
-    found, pid = detect_agent(root) if root is not None else (None, None)
-    loaded = load_state(state_dir, row["pane_id"], row["session_created"], now, stale_after)
-    if loaded is not None and loaded["state"] == "unknown":
-        loaded = None  # dead record: describes an earlier agent, not the one running now
-    if loaded is None and found is None:
-        continue
-    record = loaded["record"] if loaded else {}
-    recorded_agent = record.get("agent")
-    if not (isinstance(recorded_agent, str) and recorded_agent):
-        recorded_agent = None
-    # Without a live agent process the hook state is unconfirmed (e.g. killed
-    # without SessionEnd), so it is never reported as idle/blocked/working
-    confirmed = loaded is not None and found is not None
-    session["agents"].append({
-        "pane": row["pane_id"],
-        "target": row["session_name"] + ":" + row["window_index"] + "." + row["pane_index"],
-        "agent": found or recorded_agent,
-        "pid": pid,
-        "session_id": record.get("session_id") if loaded else None,
-        "state": loaded["state"] if confirmed else "unknown",
-        "stale": loaded["stale"] if confirmed else False,
-        "since": iso(loaded["since"]) if loaded else None,
-        "reason": record.get("reason") if loaded else None,
-        "message": record.get("message") if loaded else None,
-        "source": "hook" if loaded else "heuristic",
-        "_order": (int(row["window_index"] or 0), int(row["pane_index"] or 0)),
-    })
+sessions = view[0]
 
 if session_filter and session_filter not in sessions:
     sys.stderr.write("✗ Session " + json.dumps(session_filter, ensure_ascii=False) + " not found\n")
     sys.exit(2)
 
 wanted_states = set(s for s in states_csv.split(",") if s)
-rank = {"unknown": 0, "idle": 1, "working": 2, "blocked": 3}
 selected = []
 for name in sorted(sessions):
     session = sessions[name]
     if session_filter and name != session_filter:
         continue
-    session["agents"].sort(key=lambda agent: agent["_order"])
-    for agent in session["agents"]:
-        del agent["_order"]
     # --agent drops other agents and recomputes the session state from the rest
     if agent_filter:
         session["agents"] = [a for a in session["agents"] if a["agent"] == agent_filter]
         if not session["agents"]:
             continue
-    for agent in session["agents"]:
-        if rank[agent["state"]] > rank[session["state"]]:
-            session["state"] = agent["state"]
+    session["state"] = aggregate(session["agents"])
     # --state keeps the whole session when any agent matches
     if wanted_states and not any(a["state"] in wanted_states for a in session["agents"]):
         continue
@@ -1593,6 +1621,129 @@ result = {
 json.dump(result, sys.stdout, ensure_ascii=False)
 sys.stdout.write("\n")
 ' "$1" "$2" "$3" "$4" "$CONFIG_DIR" "$STATE_DIR" "$STALE_AFTER"
+}
+
+# tm wait <target>|--all --until <cond> [...]: block until agents reach a state.
+# Exit: 0 met, 1 timeout, 2 target gone or agent dead, 3 bad arguments, 130 SIGINT.
+_cmd_wait() {
+  local target="" all=0 until="" timeout="" interval=2 match=any after_change=0
+  local opt value
+  while [[ $# -gt 0 ]]; do
+    opt="$1"; value=""
+    case "$opt" in
+      --until=*|--timeout=*|--interval=*|--match=*) value="${opt#*=}"; opt="${opt%%=*}" ;;
+      --until|--timeout|--interval|--match)
+        [[ $# -ge 2 ]] || _wait_usage_error "${opt} needs a value"
+        value="$2"; shift ;;
+    esac
+    case "$opt" in
+      --all)          all=1 ;;
+      --after-change) after_change=1 ;;
+      --until)        until="$value" ;;
+      --timeout)      timeout="$value" ;;
+      --interval)     interval="$value" ;;
+      --match)        match="$value" ;;
+      -*)             _wait_usage_error "Unknown option: ${opt}" ;;
+      *)
+        [[ -z "$target" ]] || _wait_usage_error "Only one target is allowed"
+        target="$opt" ;;
+    esac
+    shift
+  done
+
+  if [[ $all -eq 1 && -n "$target" ]] || [[ $all -eq 0 && -z "$target" ]]; then
+    _wait_usage_error "Give either a target or --all"
+  fi
+  case "$until" in
+    idle|blocked|done|dead) ;;
+    "") _wait_usage_error "--until is required" ;;
+    *)  _wait_usage_error "Invalid --until: ${until} (idle, blocked, done, dead)" ;;
+  esac
+  case "$match" in
+    any|all) ;;
+    *) _wait_usage_error "Invalid --match: ${match} (any, all)" ;;
+  esac
+  local seconds=""
+  if [[ -n "$timeout" ]]; then
+    [[ "$timeout" =~ ^([1-9][0-9]*)([smh]?)$ ]] \
+      || _wait_usage_error "Invalid --timeout: ${timeout} (e.g. 90s, 30m, 2h)"
+    case "${BASH_REMATCH[2]}" in
+      m) seconds=$(( BASH_REMATCH[1] * 60 )) ;;
+      h) seconds=$(( BASH_REMATCH[1] * 3600 )) ;;
+      *) seconds="${BASH_REMATCH[1]}" ;;
+    esac
+  fi
+  if ! [[ "$interval" =~ ^([0-9]+(\.[0-9]*)?|\.[0-9]+)$ && "$interval" =~ [1-9] ]]; then
+    _wait_usage_error "Invalid --interval: ${interval} (positive seconds)"
+  fi
+  if ! command -v python3 &>/dev/null; then
+    echo -e "${C_RED}✗ python3 is required for tm wait${C_RESET}" >&2
+    exit 1
+  fi
+
+  # exec: signals such as SIGINT reach python directly
+  exec python3 -I -S -c "${_PY_STATE_LIB}${_PY_SNAPSHOT_LIB}"'
+target, all_flag, until, timeout, interval, match, after_change = sys.argv[1:8]
+config_dir, state_dir, stale_after = sys.argv[8], sys.argv[9], int(sys.argv[10])
+interval = float(interval)
+deadline = time.time() + int(timeout) if timeout else None
+wanted = {"idle": ("idle",), "blocked": ("blocked",), "done": ("idle", "blocked"), "dead": ()}[until]
+
+def resolve(view):
+    """Member panes of the target and the agents found in them."""
+    if view is None:
+        return [], {}
+    sessions, panes = view
+    agents = {a["pane"]: a for s in sessions.values() for a in s["agents"]}
+    if all_flag == "1":
+        return [p for p in panes if p["pane"] in agents], agents
+    if target.startswith("%"):
+        return [p for p in panes if p["pane"] == target], agents
+    if ":" in target:
+        name, _, rest = target.partition(":")
+        if "." in rest:
+            return [p for p in panes if p["target"] == target], agents
+        return [p for p in panes if p["session"] == name and p["window"] == rest], agents
+    return [p for p in panes if p["session"] == target], agents
+
+def emit(agents):
+    for agent in agents:
+        sys.stdout.write(json.dumps(agent, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+first = True
+while True:
+    now = time.time()
+    members, agents = resolve(snapshot(config_dir, state_dir, stale_after, now,
+                                       summary=False, git=False))
+    if all_flag != "1" and not members:
+        if first:
+            sys.stderr.write("✗ Target " + json.dumps(target, ensure_ascii=False) + " not found\n")
+        sys.exit(2)
+    present = [agents[p["pane"]] for p in members if p["pane"] in agents]
+    hits = [a for a in present if a["state"] in wanted]
+    if match == "any" and hits:
+        emit(hits)
+        sys.exit(0)
+    # all: every pane that has an agent must match; plain panes do not block it
+    if match == "all" and present and len(hits) == len(present):
+        emit(present)
+        sys.exit(0)
+    if deadline is not None and now >= deadline:
+        emit(present)
+        sys.exit(1)
+    first = False
+    pause = interval if deadline is None else max(0.0, min(interval, deadline - now))
+    time.sleep(pause)
+' "$target" "$all" "$until" "$seconds" "$interval" "$match" "$after_change" \
+    "$CONFIG_DIR" "$STATE_DIR" "$STALE_AFTER"
+}
+
+# Print a tm wait argument error to stderr and exit 3
+_wait_usage_error() {
+  echo -e "${C_RED}✗ $1${C_RESET}" >&2
+  echo "Usage: tm wait <target>|--all --until idle|blocked|done|dead [--timeout 30m] [--interval 2] [--match any|all] [--after-change]" >&2
+  exit 3
 }
 
 # ─── 10. AI Summary ──────────────────────────────────
@@ -2734,6 +2885,7 @@ case "${1:-}" in
   attach)          _check_cmd tmux; _cmd_attach "${@:2}" ;;
   kill|rm|remove)  _check_cmd tmux; _cmd_quick_kill "${2:-}" ;;
   ls|list)         _check_cmd tmux; _cmd_ls "${@:2}" ;;
+  wait)            _check_cmd tmux; _cmd_wait "${@:2}" ;;
   rename)          _check_cmd tmux; _cmd_rename "${2:-}" ;;
   last)            _check_cmd tmux; _cmd_last ;;
   templates|tpl)   _cmd_templates ;;

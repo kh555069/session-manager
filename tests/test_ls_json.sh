@@ -1,43 +1,6 @@
 #!/usr/bin/env bash
 source "$(dirname "$0")/lib.sh"
 
-# json <python-expr>: evaluate an expression on the JSON read from stdin (bound to d).
-# eval is safe here: expressions are literals written in this file, never input.
-json() {
-  python3 -c 'import json, sys; d = json.load(sys.stdin); v = eval(sys.argv[1]); print(json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list, bool)) or v is None else v)' "$1"
-}
-
-# set_state <target> <state> [payload]: same helper as test_list_state.sh
-set_state() {
-  local payload='{"notification_type":"permission_prompt"}'
-  [[ $# -ge 3 ]] && payload="$3"
-  printf '%s' "$payload" | TMUX_PANE="$(pane_id "$1")" "$TM" hook-state "$2"
-}
-
-# fake_agent <name>: an executable named claude/codex that just sleeps;
-# ps shows it as "/bin/bash <path>/<name>", like node-launched agents
-fake_agent() {
-  printf '#!/bin/bash\nsleep 600\n' > "$TEST_TMP/bin/$1"
-  chmod +x "$TEST_TMP/bin/$1"
-}
-
-# agent_pid <name>: pid of the fake agent itself, not tmux's "sh -c" wrapper
-agent_pid() {
-  pgrep -f "bash $TEST_TMP/bin/$1"
-}
-
-# agent_pane new|split <session-or-target>: a pane running a fake claude,
-# so hook states are confirmed by a live agent process
-agent_pane() {
-  [[ -x "$TEST_TMP/bin/claude" ]] || fake_agent claude
-  if [[ "$1" == new ]]; then
-    tmux new-session -d -s "$2" -c "$TEST_TMP" "$TEST_TMP/bin/claude"
-  else
-    tmux split-window -d -t "$2" "$TEST_TMP/bin/claude"
-  fi
-  sleep 0.3
-}
-
 # ─── Task 1: session fields ───────────────────────────
 
 test_session_fields() {
