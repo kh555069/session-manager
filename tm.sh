@@ -320,6 +320,49 @@ _state_icon() {
   esac
 }
 
+# tm state-count [--format tmux|plain]: agent counts for a status line, e.g.
+# "❓2 ⏳3 💤5"; zero counts are left out and nothing is printed on any error.
+_cmd_state_count() {
+  local format=tmux
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --format=*) format="${1#*=}" ;;
+      --format)   format="${2:-}"; shift ;;
+      *) echo "Usage: tm state-count [--format tmux|plain]" >&2; exit 3 ;;
+    esac
+    shift
+  done
+  case "$format" in
+    tmux|plain) ;;
+    *) echo "Usage: tm state-count [--format tmux|plain]" >&2; exit 3 ;;
+  esac
+  command -v tmux &>/dev/null || return 0
+
+  local blocked=0 working=0 idle=0 _target _pane st _rest
+  while IFS=$'\t' read -r _target _pane st _rest; do
+    case "$st" in
+      blocked)          blocked=$((blocked + 1)) ;;
+      working|working\?) working=$((working + 1)) ;;
+      idle)             idle=$((idle + 1)) ;;
+    esac
+  done < <(tmux list-panes -a \
+    -F $'#{session_name}\t#{pane_id}\t#{session_created}\t#{window_index}.#{pane_index}' 2>/dev/null \
+    | _agent_states pane 2>/dev/null)
+
+  local out=""
+  if [[ $blocked -gt 0 ]]; then
+    if [[ "$format" == tmux ]]; then
+      out="#[fg=red]❓${blocked}#[default]"
+    else
+      out="❓${blocked}"
+    fi
+  fi
+  [[ $working -gt 0 ]] && out="${out:+$out }⏳${working}"
+  [[ $idle -gt 0 ]] && out="${out:+$out }💤${idle}"
+  [[ -n "$out" ]] && echo "$out"
+  return 0
+}
+
 _clear_list_cache() {
   _CACHE_LOADED=0
 }
@@ -2964,6 +3007,7 @@ case "${1:-}" in
   kill|rm|remove)  _check_cmd tmux; _cmd_quick_kill "${2:-}" ;;
   ls|list)         _check_cmd tmux; _cmd_ls "${@:2}" ;;
   wait)            _check_cmd tmux; _cmd_wait "${@:2}" ;;
+  state-count)     _cmd_state_count "${@:2}" ;;
   rename)          _check_cmd tmux; _cmd_rename "${2:-}" ;;
   last)            _check_cmd tmux; _cmd_last ;;
   templates|tpl)   _cmd_templates ;;
