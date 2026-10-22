@@ -70,4 +70,43 @@ test_install_rejects_malformed_event() {
   assert_eq 0 "$(backups)" backups
 }
 
+test_installer_updates_moved_tm_path() {
+  mkdir -p "$HOME/.claude"
+  cat > "$HOME/.claude/settings.json" <<'JSON'
+{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/old/place/tm.sh hook-state idle"}]}]}}
+JSON
+  local out; out=$("$TM" install-claude-hook)
+  assert_contains "$out" "Updated" reported
+  python3 - "$HOME/.claude/settings.json" "$TM" <<'PY' || fail "Stop hook not updated"
+import json, shlex, sys
+d = json.load(open(sys.argv[1]))
+cmds = [h["command"] for g in d["hooks"]["Stop"] for h in g["hooks"]]
+assert cmds == [shlex.quote(sys.argv[2]) + " hook-state idle"], cmds
+PY
+}
+
+test_installer_leaves_foreign_hooks() {
+  mkdir -p "$HOME/.claude"
+  cat > "$HOME/.claude/settings.json" <<'JSON'
+{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "/my/wrapper.sh hook-state idle"}]}]}}
+JSON
+  "$TM" install-claude-hook >/dev/null
+  python3 - "$HOME/.claude/settings.json" "$TM" <<'PY' || fail "foreign hook changed or tm hook missing"
+import json, shlex, sys
+d = json.load(open(sys.argv[1]))
+cmds = [h["command"] for g in d["hooks"]["Stop"] for h in g["hooks"]]
+assert "/my/wrapper.sh hook-state idle" in cmds, cmds
+assert shlex.quote(sys.argv[2]) + " hook-state idle" in cmds, cmds
+PY
+}
+
+test_installer_skips_unparsable_command() {
+  mkdir -p "$HOME/.claude"
+  cat > "$HOME/.claude/settings.json" <<'JSON'
+{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "'unclosed tm.sh hook-state idle"}, {"type": "command", "command": 7}]}]}}
+JSON
+  local code; "$TM" install-claude-hook >/dev/null 2>&1; code=$?
+  assert_eq 0 "$code" exit
+}
+
 run_tests

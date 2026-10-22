@@ -2497,24 +2497,47 @@ for event in dict.fromkeys(e for e, _ in wanted):
         print(f"Failed to update Claude settings: hooks.{event} must be an array", file=sys.stderr)
         sys.exit(1)
 
-def installed(groups, suffix):
-    for group in groups:
-        if not isinstance(group, dict):
-            continue
-        for hook in group.get("hooks", []):
-            if isinstance(hook, dict) and str(hook.get("command", "")).endswith(suffix):
-                return True
-    return False
+def tm_hook(hook, suffix):
+    """None unless hook runs tm with this suffix; then "same" or "other-path".
 
-added = []
+    Only a command whose first word is tm.sh (or tm) and whose remaining words
+    are exactly the suffix counts, so a user script that merely ends in
+    "hook-state idle" is left alone.
+    """
+    if not isinstance(hook, dict) or not isinstance(hook.get("command"), str):
+        return None
+    try:
+        words = shlex.split(hook["command"])
+    except ValueError:
+        return None
+    if len(words) < 2 or os.path.basename(words[0]) not in ("tm.sh", "tm"):
+        return None
+    if words[1:] != suffix.split():
+        return None
+    return "same" if words[0] == script_path else "other-path"
+
+added, updated = [], []
 for event, suffix in wanted:
     groups = hooks.setdefault(event, [])
-    if installed(groups, suffix):
-        continue
-    groups.append({"hooks": [{"type": "command", "command": f"{quoted} {suffix}"}]})
-    added.append(f"{event} ({suffix})")
+    status = None
+    for group in groups:
+        if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+            continue
+        for hook in group["hooks"]:
+            status = tm_hook(hook, suffix)
+            if status == "other-path":
+                # tm.sh moved (e.g. a removed worktree): point the hook here
+                hook["command"] = f"{quoted} {suffix}"
+                updated.append(f"{event} ({suffix})")
+            if status:
+                break
+        if status:
+            break
+    if status is None:
+        groups.append({"hooks": [{"type": "command", "command": f"{quoted} {suffix}"}]})
+        added.append(f"{event} ({suffix})")
 
-if not added:
+if not added and not updated:
     print("Claude hooks are already installed")
     sys.exit(0)
 
@@ -2532,8 +2555,14 @@ os.chmod(temp_path, os.stat(settings_path).st_mode & 0o777 if existed else 0o600
 os.replace(temp_path, settings_path)
 
 print(f"Installed Claude hooks in {settings_path}:")
-for item in added:
-    print(f"  {item}")
+if added:
+    print("Added:")
+    for item in added:
+        print(f"  {item}")
+if updated:
+    print(f"Updated to {script_path}:")
+    for item in updated:
+        print(f"  {item}")
 if backup_path:
     print(f"Backup: {backup_path}")
 ' "$CLAUDE_SETTINGS" "$SELF"
