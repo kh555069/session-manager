@@ -104,7 +104,15 @@ _tm() {
         'options:option:((--list\:"List snapshot history"))' \
         'snapshots:snapshot:_tm_snapshots' && ret=0
       ;;
-    ls|list|last|templates|tpl|summarize-all|save|install-claude-hook|help)
+    ls|list)
+      _arguments -s \
+        '--json[Output JSON]' \
+        '--state[Keep sessions with agents in these states]:state:_values -s , state blocked working idle unknown' \
+        '--agent[Keep only this agent type]:agent:(claude codex)' \
+        '--session[Only this session]:session:_tm_sessions' \
+        '--no-summary[Skip AI summaries]' && ret=0
+      ;;
+    last|templates|tpl|summarize-all|save|install-claude-hook|help)
       # No further arguments
       ;;
   esac

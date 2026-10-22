@@ -222,6 +222,54 @@ After `tm install-claude-hook`, Claude Code hooks report each agent's state, and
 - States are stored per pane in `~/.tmux-manager/state/<pane>.json` (owner-only). `tm save` removes files of panes that no longer exist.
 - Hooks load when a Claude session starts: restart running Claude sessions after installing.
 
+## Machine Interface (`tm ls --json`)
+
+`tm ls --json` prints one JSON object with every session and its agent panes, for scripts and Leader agents. Plain `tm ls` is unchanged.
+
+```json
+{
+  "v": 1, "host": "vm-crawler-01", "generated_at": "2026-10-22T09:51:00Z",
+  "sessions": [{
+    "name": "web-app", "dir": "/home/yuan/project/web-app", "git_branch": "main",
+    "windows": 2, "panes": 2, "clients": 1, "last_activity": "2026-10-22T09:48:00Z",
+    "protected": false, "summary": null, "state": "blocked",
+    "agents": [{
+      "pane": "%12", "target": "web-app:1.0", "agent": "claude", "pid": 1315,
+      "session_id": "8f3c…", "state": "blocked", "stale": false,
+      "since": "2026-10-22T09:50:12Z", "reason": "permission",
+      "message": "Claude needs your permission to use Bash", "source": "hook"
+    }]
+  }]
+}
+```
+
+| Option | Effect |
+|--------|--------|
+| `--state <s>[,<s>]` | Keep sessions with at least one agent in these states (`blocked`, `working`, `idle`, `unknown`) |
+| `--agent <name>` | Keep only agents of this type (`claude`, `codex`); session `state` is recomputed from them |
+| `--session <name>` | Only this session |
+| `--no-summary` | Skip reading AI summaries (`summary` is `null`) |
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | Success, including an empty result |
+| `2` | The `--session` name does not exist |
+| `3` | Invalid arguments |
+| `4` | No tmux server is running |
+
+- stdout carries only JSON; warnings and errors go to stderr. Missing values are `null`, keys are never omitted.
+- `source` is `hook` when the state comes from a Claude hook, `heuristic` when an agent process was found but no hook state exists (Codex, or hooks not installed). Heuristic agents are `unknown`.
+- `stale: true` marks a `working` agent with no hook update for `TM_STALE_AFTER` seconds.
+- `target` can be passed straight to `tmux send-keys -t`. `v` only increases on breaking changes; ignore unknown keys.
+
+```bash
+# Targets of every agent waiting for you
+tm ls --json --state blocked | jq -r '.sessions[].agents[] | select(.state == "blocked") | .target'
+
+# State of the agents in one session
+tm ls --json --session web-app --no-summary | jq '.sessions[0].agents[] | {target, state, reason}'
+```
+
 ## Safety Mechanisms
 
 Three layers of protection to prevent accidental session termination:

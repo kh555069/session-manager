@@ -170,6 +170,17 @@ Codex 可在 `~/.codex/config.toml` 設定 `notify`，於一輪完成時呼叫 `
 
 整個流程只呼叫 tmux 和 ps 各一次，目標在 30 個 session 時小於 200 ms。
 
+### PR 2 決定
+
+- **過期的 working**：`state` 仍為 `working`，另加 `stale: true`。狀態維持四個值，`stale` 是新增欄位，不升版。
+- **哪些 pane 列入 `agents`**：有效狀態檔（非 `dead`）或行程樹偵測到 agent，兩者有一即列入。只有行程偵測時 `source` 為 `heuristic`、`state` 為 `unknown`；本 PR 不做畫面比對。
+- **行程偵測**：從 `pane_pid` 走行程樹，args 前兩個 token 的 basename 等於 `claude` 或 `codex` 即為 agent。`vim claude.md` 不會誤判。
+- **篩選語意**：`--agent` 先移除其他 agent，session `state` 依剩下的 agent 重算；`--state` 套在其後，session 有任一 agent 符合就保留整個 session。`--session` 找不到時，不論其他篩選都 exit 2。篩選參數沒有搭配 `--json` 時 exit 3。
+- **`session_id`** 只取狀態檔的值；Codex 要用 `lsof` 查，會超出效能目標，先輸出 `null`。
+- **`git_branch`** 直接讀 `.git/HEAD`（支援 worktree 的 `gitdir:` 檔），不呼叫 `git`；detached 時為 `null`。
+- **共用規則**：狀態檔的判斷抽成 `_PY_STATE_LIB`，fzf 畫面與 JSON 共用。
+- **效能**：30 個 session、每個都有狀態檔時，平均 139 ms（macOS，10 次平均）。
+
 ## 3. tm wait
 
 `tm wait` 阻塞到指定 agent 達成某個狀態才返回，讓 Leader 能寫出「派工、等完成、收結果」的同步流程，不必自己寫輪詢迴圈。
@@ -333,7 +344,7 @@ Notification 的 `message` 可能含指令內容或路徑，送到外部服務�
 依相依順序分四個 PR，每個都能獨立合併、獨立使用。
 
 - [x] **PR 1 狀態檔**：`tm hook-state`、擴充 `install-claude-hook`、fzf 的 `ST` 欄與 blocked 置頂、`tm save` 清理孤兒狀態檔
-- [ ] **PR 2 機器介面**：`tm ls --json` 與篩選參數、exit code 約定、zsh completion 補上新參數
+- [x] **PR 2 機器介面**：`tm ls --json` 與篩選參數、exit code 約定、zsh completion 補上新參數
 - [ ] **PR 3 等待原語**：`tm wait` 含 `--after-change` 與 inotify 模式，README 補上 Leader 使用範例
 - [ ] **PR 4 總覽與通知**：`tm dash`、`tm state-count`、`TM_NOTIFY_CMD` 推播，README 補上 tmux 綁定與 Telegram 範例
 

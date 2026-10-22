@@ -223,6 +223,54 @@ cp completions/tm.zsh ~/.zsh/completions/_tm
 - 狀態依 pane 存放在 `~/.tmux-manager/state/<pane>.json`（僅擁有者可讀）；`tm save` 會清掉已不存在的 pane 的檔案。
 - Hook 在 Claude session 啟動時載入，安裝後需重啟執行中的 Claude session。
 
+## 機器介面（`tm ls --json`）
+
+`tm ls --json` 輸出單一 JSON 物件，涵蓋所有 session 與其中的 agent pane，給腳本與 Leader agent 使用。純文字的 `tm ls` 維持不變。
+
+```json
+{
+  "v": 1, "host": "vm-crawler-01", "generated_at": "2026-10-22T09:51:00Z",
+  "sessions": [{
+    "name": "web-app", "dir": "/home/yuan/project/web-app", "git_branch": "main",
+    "windows": 2, "panes": 2, "clients": 1, "last_activity": "2026-10-22T09:48:00Z",
+    "protected": false, "summary": null, "state": "blocked",
+    "agents": [{
+      "pane": "%12", "target": "web-app:1.0", "agent": "claude", "pid": 1315,
+      "session_id": "8f3c…", "state": "blocked", "stale": false,
+      "since": "2026-10-22T09:50:12Z", "reason": "permission",
+      "message": "Claude needs your permission to use Bash", "source": "hook"
+    }]
+  }]
+}
+```
+
+| 參數 | 作用 |
+|------|------|
+| `--state <s>[,<s>]` | 只留下至少有一個 agent 處於這些狀態的 session（`blocked`、`working`、`idle`、`unknown`） |
+| `--agent <name>` | 只留下指定類型的 agent（`claude`、`codex`），session 的 `state` 依剩下的 agent 重算 |
+| `--session <name>` | 只輸出這個 session |
+| `--no-summary` | 不讀 AI 摘要（`summary` 為 `null`） |
+
+| Exit code | 意義 |
+|-----------|------|
+| `0` | 成功，包含結果為空 |
+| `2` | `--session` 指定的 session 不存在 |
+| `3` | 參數錯誤 |
+| `4` | tmux server 未啟動 |
+
+- stdout 只放 JSON，警告與錯誤寫 stderr。沒有值的欄位輸出 `null`，不省略 key。
+- `source` 為 `hook` 表示狀態來自 Claude hook；`heuristic` 表示找到 agent 行程但沒有 hook 狀態（Codex 或沒裝 hook），此時狀態為 `unknown`。
+- `stale: true` 表示 `working` 的 agent 已超過 `TM_STALE_AFTER` 秒沒有 hook 更新。
+- `target` 可直接交給 `tmux send-keys -t`。`v` 只在破壞相容時遞增，呼叫端應忽略不認得的 key。
+
+```bash
+# 列出所有在等你回應的 agent
+tm ls --json --state blocked | jq -r '.sessions[].agents[] | select(.state == "blocked") | .target'
+
+# 查看某個 session 裡的 agent 狀態
+tm ls --json --session web-app --no-summary | jq '.sessions[0].agents[] | {target, state, reason}'
+```
+
 ## 防呆機制
 
 三道防線，防止誤殺 session：

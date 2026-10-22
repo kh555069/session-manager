@@ -1068,6 +1068,9 @@ ${C_BOLD}Usage:${C_RESET}
   tm rename <name>      Rename a session
   tm last               Switch to previous session
   tm ls                 List all sessions (plain text)
+  tm ls --json [--state <s>[,<s>]] [--agent <name>] [--session <name>] [--no-summary]
+                        Machine-readable sessions and agent states
+                        (exit 2: no such session, 3: bad arguments, 4: no tmux server)
   tm templates          List available templates
   tm protect <name>     Toggle protection status
   tm summarize <name>   Generate AI summary for a session
