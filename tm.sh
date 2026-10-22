@@ -1910,9 +1910,10 @@ sys.stdout.write("\n")
 }
 
 # tm wait <target>|--all --until <cond> [...]: block until agents reach a state.
-# Exit: 0 met, 1 timeout, 2 target gone or agent dead, 3 bad arguments, 130 SIGINT.
+# Exit: 0 met, 1 timeout, 2 target gone or agent dead, 3 bad arguments,
+#       5 internal error, 130 SIGINT, 143 SIGTERM.
 _cmd_wait() {
-  local target="" all=0 until="" timeout="" interval=2 match=any after_change=0
+  local target="" all=0 until="" timeout="" timeout_given=0 interval=2 match=any after_change=0
   local opt value
   while [[ $# -gt 0 ]]; do
     opt="$1"; value=""
@@ -1926,7 +1927,7 @@ _cmd_wait() {
       --all)          all=1 ;;
       --after-change) after_change=1 ;;
       --until)        until="$value" ;;
-      --timeout)      timeout="$value" ;;
+      --timeout)      timeout="$value"; timeout_given=1 ;;
       --interval)     interval="$value" ;;
       --match)        match="$value" ;;
       -*)             _wait_usage_error "Unknown option: ${opt}" ;;
@@ -1950,8 +1951,10 @@ _cmd_wait() {
     *) _wait_usage_error "Invalid --match: ${match} (any, all)" ;;
   esac
   local seconds=""
-  if [[ -n "$timeout" ]]; then
-    [[ "$timeout" =~ ^([1-9][0-9]*)([smh]?)$ ]] \
+  # An empty --timeout (e.g. an unset variable) must not silently mean "forever";
+  # at most 7 digits keeps the arithmetic far from overflow (9999999h ≈ 1141 years)
+  if [[ $timeout_given -eq 1 ]]; then
+    [[ "$timeout" =~ ^([1-9][0-9]{0,6})([smh]?)$ ]] \
       || _wait_usage_error "Invalid --timeout: ${timeout} (e.g. 90s, 30m, 2h)"
     case "${BASH_REMATCH[2]}" in
       m) seconds=$(( BASH_REMATCH[1] * 60 )) ;;
@@ -2016,10 +2019,18 @@ def sleep_until_next(pause):
     """Sleep up to pause seconds; with inotifywait, wake early on a state file change."""
     global watcher
     if inotifywait and pause >= 1 and os.path.isdir(state_dir):
-        watcher = subprocess.Popen(
-            [inotifywait, "-qq", "-t", str(math.ceil(pause)),
-             "-e", "close_write,moved_to,create,delete", state_dir],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Signals are held until watcher is set, so stop() always sees the child;
+        # the child unblocks them again, or terminate() could not end it
+        held = {signal.SIGINT, signal.SIGTERM}
+        signal.pthread_sigmask(signal.SIG_BLOCK, held)
+        try:
+            watcher = subprocess.Popen(
+                [inotifywait, "-qq", "-t", str(math.ceil(pause)),
+                 "-e", "close_write,moved_to,create,delete", state_dir],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, held))
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
         watcher.wait()
         watcher = None
     else:
@@ -2027,57 +2038,71 @@ def sleep_until_next(pause):
 
 # Agents seen with a live process, by pane; one that later loses its pane,
 # its agent entry or its process is dead (kill -9 never writes a dead state)
-seen = {}
-baseline = None
-first = True
-while True:
-    now = time.time()
-    view = snapshot(config_dir, state_dir, stale_after, now, summary=False, git=False)
-    members, agents = resolve(view)
-    alive_panes = set(p["pane"] for p in view[1]) if view else set()
-    dead = []
-    for pane, agent in list(seen.items()):
-        current = agents.get(pane)
-        if pane not in alive_panes or current is None or current["pid"] is None:
-            dead.append(dict(agent, state="dead", pid=None))
-            del seen[pane]
-    if dead:
-        if until != "dead":
-            emit(dead)
+def main():
+    seen = {}
+    dead_all = []  # every agent that died while waiting, in order
+    baseline = None
+    first = True
+    while True:
+        now = time.time()
+        view = snapshot(config_dir, state_dir, stale_after, now, summary=False, git=False)
+        members, agents = resolve(view)
+        alive_panes = set(p["pane"] for p in view[1]) if view else set()
+        dead = []
+        for pane, agent in list(seen.items()):
+            current = agents.get(pane)
+            if pane not in alive_panes or current is None or current["pid"] is None:
+                dead.append(dict(agent, state="dead", pid=None))
+                del seen[pane]
+        dead_all.extend(dead)
+        if dead:
+            if until != "dead":
+                emit(dead_all)
+                sys.exit(2)
+            if match == "any" or not any(a["pid"] is not None for a in agents.values()
+                                         if a["pane"] in set(p["pane"] for p in members)):
+                emit(dead_all)
+                sys.exit(0)
+        if all_flag != "1" and not members:
+            if first:
+                sys.stderr.write("✗ Target " + json.dumps(target, ensure_ascii=False) + " not found\n")
             sys.exit(2)
-        if match == "any" or not any(a["pid"] is not None for a in agents.values()
-                                     if a["pane"] in set(p["pane"] for p in members)):
-            emit(dead)
+        present = [agents[p["pane"]] for p in members if p["pane"] in agents]
+        for agent in present:
+            if agent["pid"] is not None:
+                seen[agent["pane"]] = agent
+        if baseline is None:
+            # --after-change: only a (state, since) different from the one at call
+            # time counts; since alone misses a turn started and ended in one second
+            baseline = {p["pane"]: (agents[p["pane"]]["state"], agents[p["pane"]]["since"])
+                        if p["pane"] in agents else None for p in members}
+        hits = [a for a in present if a["state"] in wanted
+                and (after_change != "1" or (a["since"] is not None
+                                             and (a["state"], a["since"]) != baseline.get(a["pane"])))]
+        if match == "any" and hits:
+            emit(hits)
             sys.exit(0)
-    if all_flag != "1" and not members:
-        if first:
-            sys.stderr.write("✗ Target " + json.dumps(target, ensure_ascii=False) + " not found\n")
-        sys.exit(2)
-    present = [agents[p["pane"]] for p in members if p["pane"] in agents]
-    for agent in present:
-        if agent["pid"] is not None:
-            seen[agent["pane"]] = agent
-    if baseline is None:
-        # --after-change: only a (state, since) different from the one at call
-        # time counts; since alone misses a turn started and ended in one second
-        baseline = {p["pane"]: (agents[p["pane"]]["state"], agents[p["pane"]]["since"])
-                    if p["pane"] in agents else None for p in members}
-    hits = [a for a in present if a["state"] in wanted
-            and (after_change != "1" or (a["since"] is not None
-                                         and (a["state"], a["since"]) != baseline.get(a["pane"])))]
-    if match == "any" and hits:
-        emit(hits)
-        sys.exit(0)
-    # all: every pane that has an agent must match; plain panes do not block it
-    if match == "all" and present and len(hits) == len(present):
-        emit(present)
-        sys.exit(0)
-    if deadline is not None and now >= deadline:
-        emit(present)
-        sys.exit(1)
-    first = False
-    pause = interval if deadline is None else max(0.0, min(interval, deadline - now))
-    sleep_until_next(pause)
+        # all: every pane that has an agent must match; plain panes do not block it
+        if match == "all" and present and len(hits) == len(present):
+            emit(present)
+            sys.exit(0)
+        if deadline is not None and now >= deadline:
+            emit(present)
+            sys.exit(1)
+        first = False
+        pause = interval if deadline is None else max(0.0, min(interval, deadline - now))
+        sleep_until_next(pause)
+
+# Exit 5 for anything unexpected (e.g. stdout closed), so a crash is never
+# mistaken for exit 1 "timed out, still working"; sys.exit is not caught
+try:
+    main()
+except Exception as error:
+    try:
+        sys.stderr.write("\u2717 tm wait internal error: " + error.__class__.__name__ + "\n")
+    except Exception:
+        pass
+    stop(5)
 ' "$target" "$all" "$until" "$seconds" "$interval" "$match" "$after_change" \
     "$CONFIG_DIR" "$STATE_DIR" "$STALE_AFTER"
 }

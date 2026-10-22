@@ -244,4 +244,38 @@ test_sigint_exits_130() {
   assert_eq "" "$(pgrep -f "$TEST_TMP/bin/inotifywait")" no-leftover-watcher
 }
 
+test_until_dead_all_prints_every_agent() {
+  agent_pane new a
+  agent_pane split a
+  set_state a:0.0 idle; set_state a:0.1 idle
+  local p0 p1
+  p0=$(tmux display-message -p -t a:0.0 '#{pane_pid}'); p1=$(tmux display-message -p -t a:0.1 '#{pane_pid}')
+  # Killing a pane's process closes the pane; the second one ends the session
+  later 0.5 kill "$p0"
+  later 1.5 kill "$p1"
+  local out; out=$("$TM" wait a --until dead --match all --interval 0.2 --timeout 6s)
+  wait
+  assert_eq 2 "$(printf '%s\n' "$out" | grep -c '"dead"')" both-printed
+}
+
+test_empty_or_huge_timeout_exit_3() {
+  new_session a
+  local args code
+  for args in "--timeout=" "--timeout 99999999h"; do
+    # shellcheck disable=SC2086
+    "$TM" wait a --until idle $args >/dev/null 2>&1; code=$?
+    assert_eq 3 "$code" "args <$args>"
+  done
+  "$TM" wait a --until idle --timeout "" >/dev/null 2>&1; code=$?
+  assert_eq 3 "$code" empty-separate-arg
+}
+
+# A closed stdout makes writing the result fail: an internal error, not a timeout
+test_internal_error_exit_5() {
+  agent_pane new a
+  set_state a idle
+  local code; "$TM" wait a --until idle --timeout 2s >&- 2>/dev/null; code=$?
+  assert_eq 5 "$code" exit
+}
+
 run_tests
