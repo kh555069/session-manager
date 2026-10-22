@@ -272,4 +272,28 @@ test_bad_args_exit_3() {
   done
 }
 
+test_deeply_nested_state_file() {
+  agent_pane new a
+  mkdir -p "$STATE_DIR"
+  python3 -c 'print("[" * 100000)' > "$STATE_DIR/$(pane_id a | tr -d %).json"
+  local out code; out=$("$TM" ls --json 2>/dev/null); code=$?
+  assert_eq 0 "$code" exit
+  assert_eq heuristic "$(json 'd["sessions"][0]["agents"][0]["source"]' <<< "$out")" source
+  assert_contains "$("$TM" _list)" "a" fzf-list-still-works
+}
+
+test_non_string_fields_become_null() {
+  agent_pane new a
+  set_state a blocked
+  local f; f="$STATE_DIR/$(pane_id a | tr -d %).json"
+  python3 - "$f" <<'PY'
+import json, sys
+p = sys.argv[1]; d = json.load(open(p))
+d.update(reason={"x": 1}, message=5, session_id=[1]); json.dump(d, open(p, "w"))
+PY
+  local out; out=$("$TM" ls --json)
+  assert_eq '[null, null, null]' \
+    "$(json '[d["sessions"][0]["agents"][0][k] for k in ("reason", "message", "session_id")]' <<< "$out")" nulls
+}
+
 run_tests

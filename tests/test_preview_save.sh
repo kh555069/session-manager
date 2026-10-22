@@ -71,4 +71,15 @@ test_preview_no_screen_for_idle() {
   assert_not_contains "$("$TM" _preview a)" "SCREEN-MARKER" idle
 }
 
+test_save_removes_stale_tmp_files() {
+  new_session a
+  set_state a idle '{}'
+  local stale="$STATE_DIR/$(pane_id a | tr -d %).json.99999.tmp" fresh="$STATE_DIR/1.json.88888.tmp"
+  echo '{' > "$stale"; echo '{' > "$fresh"
+  touch -t 202001010000 "$stale"
+  "$TM" save >/dev/null
+  [[ ! -e "$stale" ]] || fail "stale tmp kept"
+  [[ -e "$fresh" ]] || fail "fresh tmp removed (a hook may be writing it)"
+}
+
 run_tests

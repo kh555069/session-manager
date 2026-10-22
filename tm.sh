@@ -239,10 +239,16 @@ def load_state(state_dir, pane, created, now, stale_after):
     try:
         with open(os.path.join(state_dir, pane.lstrip("%") + ".json")) as f:
             record = json.load(f)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
     if not isinstance(record, dict):
         return None
+    # Text fields are passed on to the list, JSON and notifications: anything
+    # but a string (a hand-edited or foreign file) is treated as missing
+    record = dict(record)
+    for key in ("reason", "message", "session_id", "agent"):
+        if not isinstance(record.get(key), str):
+            record[key] = None
     state = record.get("state")
     ts = epoch(record.get("ts"))
     if state not in ("working", "blocked", "idle", "dead") or ts is None:
@@ -2768,10 +2774,19 @@ _clean_orphan_states() {
   [[ -d "$STATE_DIR" ]] || return 0
   local removed
   removed=$(tmux list-panes -a -F '#{pane_id}' 2>/dev/null | python3 -I -S -c '
-import glob, os, sys
+import glob, os, sys, time
 
 live = {line.strip().lstrip("%") for line in sys.stdin if line.strip()}
 removed = 0
+# Temp files of a hook that died mid-write; a minute old means nobody is
+# still writing them
+for path in glob.glob(os.path.join(sys.argv[1], "*.json.*.tmp")):
+    try:
+        if time.time() - os.path.getmtime(path) > 60:
+            os.remove(path)
+            removed += 1
+    except OSError:
+        pass
 if not live:
     # tmux returned nothing (server gone mid-save): never treat that as
     # "every pane is dead"
@@ -3286,6 +3301,13 @@ PY
 
 # ─── 12. Self-routing ─────────────────────────────────
 
+# The hook runs on every Claude tool call: it needs none of _init's
+# directories and must never fail because of them (e.g. a read-only HOME)
+if [[ "${1:-}" == "hook-state" ]]; then
+  _cmd_hook_state "${2:-}"
+  exit
+fi
+
 _init
 
 case "${1:-}" in
@@ -3300,7 +3322,6 @@ case "${1:-}" in
   _create)         _cmd_create ;;
   _summarize)      _cmd_summarize "${2:-}" ;;
   _record-claude-session) _cmd_record_claude_session ;;
-  hook-state)      _cmd_hook_state "${2:-}" ;;
   _notify)         _cmd_notify ;;
 
   # User-facing CLI commands (only need tmux, not fzf)

@@ -128,4 +128,12 @@ test_dead_state() {
   assert_eq dead "$(field state)" state
 }
 
+test_hook_ignores_unwritable_home() {
+  local ro="$TEST_TMP/ro-home"; mkdir -p "$ro"; chmod 500 "$ro"
+  local code
+  printf '{}' | HOME="$ro" TMUX_PANE=%1 "$TM" hook-state idle; code=$?
+  chmod 700 "$ro"
+  assert_eq 0 "$code" exit
+}
+
 run_tests
