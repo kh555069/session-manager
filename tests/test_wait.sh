@@ -125,4 +125,52 @@ test_bad_args_exit_3() {
   done
 }
 
+# ─── Task 2: dead agents and --after-change ───────────
+
+test_after_change_ignores_previous_idle() {
+  agent_pane new a
+  set_state a idle
+  local code; "$TM" wait a --until idle --after-change --interval 0.2 --timeout 1s >/dev/null; code=$?
+  assert_eq 1 "$code" no-change-times-out
+  # since has one-second resolution: let the new working/idle get a different since
+  later 1.1 set_state a working
+  later 2.2 set_state a idle
+  local out; out=$("$TM" wait a --until idle --after-change --interval 0.2 --timeout 6s); code=$?
+  wait
+  assert_eq 0 "$code" changed
+  assert_eq idle "$(json 'd["state"]' <<< "$out")" state
+}
+
+test_killed_agent_exits_2() {
+  agent_pane new a
+  set_state a working
+  later 0.5 pkill -f "bash $TEST_TMP/bin/claude"
+  local out code; out=$("$TM" wait a --until done --interval 0.2 --timeout 5s); code=$?
+  wait
+  assert_eq 2 "$code" exit
+  assert_eq dead "$(json 'd["state"]' <<< "$out")" state
+  assert_eq null "$(json 'd["pid"]' <<< "$out")" pid
+}
+
+test_closed_pane_exits_2() {
+  agent_pane new a
+  agent_pane split a
+  set_state a:0.1 working
+  local pid; pid=$(tmux display-message -p -t a:0.1 '#{pane_pid}')
+  later 0.5 kill "$pid"
+  local code; "$TM" wait a:0.1 --until idle --interval 0.2 --timeout 5s >/dev/null 2>&1; code=$?
+  wait
+  assert_eq 2 "$code" exit
+}
+
+test_until_dead_exit_0() {
+  agent_pane new a
+  set_state a idle
+  later 0.5 pkill -f "bash $TEST_TMP/bin/claude"
+  local out code; out=$("$TM" wait a --until dead --interval 0.2 --timeout 5s); code=$?
+  wait
+  assert_eq 0 "$code" exit
+  assert_eq dead "$(json 'd["state"]' <<< "$out")" state
+}
+
 run_tests

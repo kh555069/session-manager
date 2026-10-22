@@ -1711,17 +1711,44 @@ def emit(agents):
         sys.stdout.write(json.dumps(agent, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
+# Agents seen with a live process, by pane; one that later loses its pane,
+# its agent entry or its process is dead (kill -9 never writes a dead state)
+seen = {}
+baseline = None
 first = True
 while True:
     now = time.time()
-    members, agents = resolve(snapshot(config_dir, state_dir, stale_after, now,
-                                       summary=False, git=False))
+    view = snapshot(config_dir, state_dir, stale_after, now, summary=False, git=False)
+    members, agents = resolve(view)
+    alive_panes = set(p["pane"] for p in view[1]) if view else set()
+    dead = []
+    for pane, agent in list(seen.items()):
+        current = agents.get(pane)
+        if pane not in alive_panes or current is None or current["pid"] is None:
+            dead.append(dict(agent, state="dead", pid=None))
+            del seen[pane]
+    if dead:
+        if until != "dead":
+            emit(dead)
+            sys.exit(2)
+        if match == "any" or not any(a["pid"] is not None for a in agents.values()
+                                     if a["pane"] in set(p["pane"] for p in members)):
+            emit(dead)
+            sys.exit(0)
     if all_flag != "1" and not members:
         if first:
             sys.stderr.write("✗ Target " + json.dumps(target, ensure_ascii=False) + " not found\n")
         sys.exit(2)
     present = [agents[p["pane"]] for p in members if p["pane"] in agents]
-    hits = [a for a in present if a["state"] in wanted]
+    for agent in present:
+        if agent["pid"] is not None:
+            seen[agent["pane"]] = agent
+    if baseline is None:
+        # --after-change: only a since different from the one at call time counts
+        baseline = {p["pane"]: agents[p["pane"]]["since"] if p["pane"] in agents else None
+                    for p in members}
+    hits = [a for a in present if a["state"] in wanted
+            and (after_change != "1" or (a["since"] is not None and a["since"] != baseline.get(a["pane"])))]
     if match == "any" and hits:
         emit(hits)
         sys.exit(0)
