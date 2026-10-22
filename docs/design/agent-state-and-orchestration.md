@@ -374,8 +374,8 @@ Notification 的 `message` 可能含指令內容或路徑，送到外部服務�
 - **Agent 偵測**：第 2 個 token 只在第 1 個是直譯器或啟動器（`node`、`bun`、`deno`、`bash`、`sh`、`zsh`、`env`、`npx`、`python*`）時才算，`less claude`、`ssh codex` 不再誤判。
 - **`tm ls --json`**：`session_path` 放在 tmux 欄位最後，含 tab 的路徑不會讓 session 消失；`--state` 不做萬用字元展開；`--agent` 只接受 `claude`、`codex`；JSON 輸出（含 `tm wait` 與推播）把 U+0080–U+009F 跳脫成 `\u00XX`。
 - **`tm wait`**：`--until dead` 印出等待期間所有結束的 agent；`--timeout` 給了就不能是空值，數字最多 7 位；未預期的例外 exit 5；啟動 `inotifywait` 前後擋住 SIGINT、SIGTERM，子行程在 exec 前解除。
-- **fzf 相關**：fzf action 一律使用 `printf %q` 跳脫過的 tm.sh 路徑（路徑含 `)` 仍不支援，fzf 會在第一個 `)` 結束 action）；dash 啟動時清掉 pid 已不存在或不是 `tm dash` 的 `run/dash-<pid>.*`；`state-count` 以 pane id 去重、`--format` 缺值時 exit 3；preview 所有帶外部文字的行改用 `printf %s`。
-- **安裝器**：第 1 個字是 `tm.sh` 或 `tm`、其餘與 suffix 完全相同的 hook 才算 tm 的 hook；路徑不同時改成目前的路徑並列在 `Updated` 區塊，使用者自己的 hook 不動。
+- **fzf 相關**：fzf action 一律使用 `printf %q` 跳脫過的 tm.sh 路徑（路徑含 `)` 仍不支援，fzf 會在第一個 `)` 結束 action）；dash 啟動時清掉 pid 已不存在、或不是 dash 的 `run/dash-<pid>.*`（pid 還在且 socket 有回應就是 dash；沒有 socket 時才看行程參數，`bash tm.sh dash` 等相對路徑也認得）；`state-count` 以 pane id 去重、`--format` 缺值時 exit 3；preview 所有帶外部文字的行改用 `printf %s`，AI 摘要先還原儲存時跳脫的 `\\`。
+- **安裝器**：某個字是 `tm.sh` 或 `tm`、而且後面剛好是 suffix 的 hook 才算 tm 的 hook。tm.sh 是第 1 個字、路徑不同時改成目前的路徑並列在 `Updated` 區塊；前面還有東西時（環境變數、`bash tm.sh` 等）視為使用者的包裝，算已安裝但不改寫，也不會再加一份；其他 hook 不動。
 - **不修**：`join-pane` 後短暫 `unknown`（tmux 沒有 pane 建立時間可比對）、`_session_agent_state` 的 O(n²)（30 個 session 時不到 1 ms）、「Enter 選取 session」的自動化測試（需要真的 tmux client，手動測試 14-7 涵蓋）。
 
 ## 實作順序與待確認問題

@@ -641,6 +641,8 @@ _cmd_preview() {
       if [[ -n "$last_summary" && "$last_summary" != "$last_line" ]]; then
         local summary_age
         summary_age=$(_relative_time "$last_ts")
+        # _cmd_summarize stores the text JSON-escaped: undo its \\ escaping
+        last_summary="${last_summary//\\\\/\\}"
         printf '💡 %s %s(%s)%s\n' "$last_summary" "$C_DIM" "$summary_age" "$C_RESET"
       fi
     fi
@@ -1185,17 +1187,22 @@ _cmd_dash() {
 
 # Remove run/ files left by a dash that is gone (e.g. killed with SIGKILL). A
 # pid that is alive but is not a tm dash was reused, so its files are stale too.
-# Only dash-<pid>.{sock,out,list} names are touched.
+# A dash is live when its socket answers; while it has none (between two fzf
+# runs) its command line decides. Only dash-<pid>.{sock,out,list} are touched.
 _dash_sweep() {
   local dir="$1" f base pid args
-  local is_dash='(^|/)tm(\.sh)? dash( |$)'
+  local is_dash='(^|[ /])tm(\.sh)? +dash( |$)'
   for f in "$dir"/dash-*.sock "$dir"/dash-*.out "$dir"/dash-*.list; do
     [[ -e "$f" ]] || continue
     base="${f##*/dash-}"
     pid="${base%.*}"
     [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
-    args=$(ps -o args= -p "$pid" 2>/dev/null || true)
-    [[ "$args" =~ $is_dash ]] && continue
+    if kill -0 "$pid" 2>/dev/null; then
+      curl -s --max-time 1 --unix-socket "$dir/dash-$pid.sock" http://localhost >/dev/null 2>&1 \
+        && continue
+      args=$(ps -o args= -p "$pid" 2>/dev/null || true)
+      [[ "$args" =~ $is_dash ]] && continue
+    fi
     rm -f "$f"
   done
   return 0
@@ -2499,11 +2506,12 @@ for event in dict.fromkeys(e for e, _ in wanted):
         sys.exit(1)
 
 def tm_hook(hook, suffix):
-    """None unless hook runs tm with this suffix; then "same" or "other-path".
+    """None unless hook runs tm with this suffix; then "same", "other-path"
+    (tm.sh is the first word but at another path) or "wrapper" (something
+    runs before tm.sh, e.g. an env assignment or "bash").
 
-    Only a command whose first word is tm.sh (or tm) and whose remaining words
-    are exactly the suffix counts, so a user script that merely ends in
-    "hook-state idle" is left alone.
+    A word named tm.sh (or tm) must be followed by exactly the suffix, so a
+    user script that merely ends in "hook-state idle" is left alone.
     """
     if not isinstance(hook, dict) or not isinstance(hook.get("command"), str):
         return None
@@ -2511,11 +2519,15 @@ def tm_hook(hook, suffix):
         words = shlex.split(hook["command"])
     except ValueError:
         return None
-    if len(words) < 2 or os.path.basename(words[0]) not in ("tm.sh", "tm"):
-        return None
-    if words[1:] != suffix.split():
-        return None
-    return "same" if words[0] == script_path else "other-path"
+    expected = suffix.split()
+    for i, word in enumerate(words):
+        if os.path.basename(word) in ("tm.sh", "tm") and words[i + 1:] == expected:
+            if i > 0:
+                # The user wraps tm (env assignment, "bash tm.sh", ...): it is
+                # installed, but repointing it could break their wrapper
+                return "wrapper"
+            return "same" if word == script_path else "other-path"
+    return None
 
 added, updated = [], []
 for event, suffix in wanted:

@@ -82,15 +82,17 @@ test_save_removes_stale_tmp_files() {
   [[ -e "$fresh" ]] || fail "fresh tmp removed (a hook may be writing it)"
 }
 
-# AI summaries and session paths are outside text: echo -e would turn a
-# literal \t into a tab (tmux itself escapes backslashes in session names)
+# AI summaries and session paths are outside text: echo -e would expand
+# backslashes (tmux itself escapes backslashes in session names)
 test_preview_prints_backslashes_literally() {
   mkdir -p "$TEST_TMP/dir\\tname"
   tmux new-session -d -s a -c "$TEST_TMP/dir\\tname" "sleep 600"
   mkdir -p "$HOME/.tmux-manager/summaries"
-  printf '%s\n' '{"ts":1,"summary":"fix a\tb parsing"}' > "$HOME/.tmux-manager/summaries/a.jsonl"
+  # Stored the way _cmd_summarize writes it: backslashes JSON-escaped
+  printf '%s\n' '{"ts":1,"summary":"Edits C:\\Users\\dev and \\t files"}' > "$HOME/.tmux-manager/summaries/a.jsonl"
   local out; out=$("$TM" _preview a)
-  assert_contains "$out" 'fix a\tb parsing' literal-summary
+  assert_contains "$out" 'Edits C:\Users\dev and \t files' decoded-summary
+  assert_not_contains "$out" 'C:\\Users' no-doubled-backslash
   assert_contains "$out" 'dir\tname' literal-path
 }
 

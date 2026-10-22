@@ -169,4 +169,19 @@ test_dash_keeps_files_of_live_dash() {
   [[ -S "$first" ]] || fail "second dash removed the first dash's socket"
 }
 
+
+# A dash started as "bash tm.sh dash" (relative path) is still a live dash
+test_dash_sweep_keeps_relative_path_dash() {
+  new_session a
+  tmux new-session -d -s dash -x 120 -y 40 -c "$TEST_TMP/bin" "bash tm.sh dash"
+  local i first=""
+  for i in $(seq 50); do first=$(ls "$HOME"/.tmux-manager/run/dash-*.sock 2>/dev/null | head -1); [[ -n "$first" ]] && break; sleep 0.1; done
+  [[ -n "$first" ]] || fail "first dash socket not found"
+  sleep 0.5
+  tmux new-session -d -s dash2 -x 120 -y 40 "$TM dash"
+  sleep 1.5
+  [[ -S "$first" ]] || fail "second dash removed the first dash's socket"
+  [[ -f "${first%.sock}.out" ]] || fail "second dash removed the first dash's out file"
+}
+
 run_tests

@@ -109,4 +109,19 @@ JSON
   assert_eq 0 "$code" exit
 }
 
+
+# A tm hook behind an env assignment or "bash" is the user's wrapper around
+# tm: it must not be repointed, and no duplicate tm hook may be added
+test_installer_no_duplicate_beside_prefixed_tm_hook() {
+  mkdir -p "$HOME/.claude"
+  cat > "$HOME/.claude/settings.json" <<'JSON'
+{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "TM_NOTIFY_ON=blocked,idle /x/tm.sh hook-state idle"}]}],
+           "Notification": [{"hooks": [{"type": "command", "command": "bash /x/tm.sh hook-state blocked"}]}]}}
+JSON
+  "$TM" install-claude-hook >/dev/null
+  assert_eq 1 "$(count_cmd Stop 'hook-state idle')" stop-once
+  assert_eq 1 "$(count_cmd Notification 'hook-state blocked')" notification-once
+  assert_contains "$(cat "$HOME/.claude/settings.json")" "TM_NOTIFY_ON=blocked,idle /x/tm.sh hook-state idle" wrapper-kept
+}
+
 run_tests
