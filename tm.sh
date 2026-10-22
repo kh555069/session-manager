@@ -2,7 +2,9 @@
 # ╭──────────────────────────────────────────────────────╮
 # │  tm -- tmux Session Manager                          │
 # │  Self-routing single-file script                     │
-# │  Dependencies: bash 4+, tmux, fzf                    │
+# │  Dependencies: bash 3.2+, tmux, fzf                  │
+# │  Optional: python3 (agent state, JSON, snapshots),   │
+# │            curl (tm dash), inotifywait (faster wait) │
 # ╰──────────────────────────────────────────────────────╯
 # Auto-detect tmux binary; define wrapper only when not in PATH
 if ! command -v tmux &>/dev/null; then
@@ -2138,6 +2140,9 @@ try:
 except Exception as error:
     try:
         sys.stderr.write("\u2717 tm wait internal error: " + error.__class__.__name__ + "\n")
+        # stop() ends with os._exit, which skips flushing (stderr is only
+        # line-buffered from Python 3.9)
+        sys.stderr.flush()
     except Exception:
         pass
     stop(5)
