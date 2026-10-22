@@ -365,6 +365,70 @@ tm wait --all --until done --after-change --match any
 - When `agent-prompt.sh` returns `12` the text may still be in the input box; resending would create two tasks, so a person has to decide first.
 - `tm wait` is a candidate replacement for `agent-state.sh wait`; until the Leader rules change, Worker state is still read with `agent-state.sh`.
 
+## Overview and Notifications
+
+Three more ways to see agent states, all reading the same state files: `tm dash` for when you are at the screen, `tm state-count` for the tmux status line, and push notifications for when you are away.
+
+### `tm dash`
+
+The main menu list with the same keys, but it refreshes itself: whenever a state file changes (with `inotifywait`) or every 2 seconds otherwise. The cursor stays on the session it was on, even when a blocked session moves to the top. The preview shows the last 15 screen lines of every blocked pane, so you can see what it is asking without attaching.
+
+```
+# ~/.tmux.conf
+bind D display-popup -w 90% -h 85% -E "tm dash --popup"
+# or keep it in its own window
+bind W new-window -n dash "tm dash"
+```
+
+- `--popup`: after Enter, switch to the session and exit, which closes the popup. tmux gives a program no reliable way to know it runs inside a popup, so this is a flag.
+- Without `--popup`, Enter switches (inside tmux) or attaches (outside) and then comes back to the dash.
+- fzf is controlled through a socket in `~/.tmux-manager/run/` (owner-only). Esc, Ctrl-C, closing the popup, or killing the dash also stops its background refresh loop.
+- Needs `curl`.
+
+### `tm state-count`
+
+Agent counts for the status line; zero counts are left out and nothing is printed when there are no agents or no tmux server.
+
+```
+$ tm state-count
+#[fg=red]❓2#[default] ⏳3 💤5
+$ tm state-count --format plain
+❓2 ⏳3 💤5
+```
+
+```
+# ~/.tmux.conf
+set -g status-interval 5
+set -g status-right '#(tm state-count) | %H:%M'
+```
+
+It reads the same data as the menu (state files plus one `tmux list-panes`); stale `working` counts as ⏳. tmux runs `#()` asynchronously, so it never slows the screen down.
+
+### Notifications
+
+Set `TM_NOTIFY_CMD` and `tm hook-state` runs it on state transitions. tm.sh is not tied to any notification service.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `TM_NOTIFY_CMD` | (unset: no notifications) | Shell command; gets the agent as one JSON line on stdin — the `tm ls --json` `agents[]` format plus `host` and `tmux_session` (`pid` is `null`) |
+| `TM_NOTIFY_ON` | `blocked` | Comma-separated states to notify about: `blocked`, `idle`, `working`, `dead`. `blocked,idle` also tells you when a turn finishes |
+
+- Only **transitions** notify: writing the same state again does not. `idle` notifies only after `working` (a finished turn), never on session start.
+- At most one notification per pane per minute, so a burst of permission prompts does not flood you.
+- The command runs detached with a 5-second timeout (its whole process group is killed on timeout); the hook never waits for it.
+- Failures (timeout, non-zero exit) are logged to `~/.tmux-manager/notify.log` (owner-only) with time, pane, state and result — never the message text.
+- `TM_NOTIFY_CMD` is read from the environment Claude Code runs in, so export it where you start Claude.
+
+Telegram example, using an existing bot:
+
+```bash
+export TM_NOTIFY_CMD='jq -r "\(.host)/\(.tmux_session) \(.state): \(.message // "")" \
+  | curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+      --data-urlencode chat_id=$TG_CHAT --data-urlencode text@-'
+```
+
+The notification `message` can contain command text or paths. Check that sending it to an outside service is acceptable; if not, send only the session name and state.
+
 ## Safety Mechanisms
 
 Three layers of protection to prevent accidental session termination:
@@ -381,6 +445,8 @@ Three layers of protection to prevent accidental session termination:
 | `TM_SNAPSHOT_KEEP` | `48`                       | Number of timestamped snapshots kept by `tm save` |
 | `TM_SORT`          | (unset)                    | `recent` stops floating blocked agents to the top |
 | `TM_STALE_AFTER`   | `1800`                     | Seconds without a hook update before working shows as `⏳?` |
+| `TM_NOTIFY_CMD`    | (unset)                    | Command run on agent state transitions (see Notifications) |
+| `TM_NOTIFY_ON`     | `blocked`                  | States to notify about, comma-separated |
 
 ---
 

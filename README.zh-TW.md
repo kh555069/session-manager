@@ -366,6 +366,70 @@ tm wait --all --until done --after-change --match any
 - `agent-prompt.sh` 回 `12` 時文字可能還留在輸入框，重送會變成兩份任務，必須先交給使用者判斷。
 - `tm wait` 是 `agent-state.sh wait` 的候選替代；在 Leader 規則改版前，Worker 狀態判讀仍以 `agent-state.sh` 為準。
 
+## 狀態總覽與通知
+
+另外三種看 agent 狀態的方式，都讀同一份狀態檔：坐在電腦前用 `tm dash`，工作中瞄一眼用 tmux 狀態列的 `tm state-count`，離開電腦時靠推播通知。
+
+### `tm dash`
+
+與主選單相同的列表與快捷鍵，但會自動更新：狀態檔一變更就重新載入（需要 `inotifywait`），否則每 2 秒一次。即使有 session 變成 blocked 被排到最上面，游標也會停在原本的 session。Preview 會顯示每個 blocked pane 最後 15 行畫面，不用 attach 就能看到它在問什麼。
+
+```
+# ~/.tmux.conf
+bind D display-popup -w 90% -h 85% -E "tm dash --popup"
+# 或常駐在專用 window
+bind W new-window -n dash "tm dash"
+```
+
+- `--popup`：按 Enter 後切換到該 session 並結束，popup 隨之關閉。tmux 沒有可靠的方式讓程式知道自己在 popup 裡，所以用參數指定。
+- 沒有 `--popup` 時，按 Enter 會切換（tmux 內）或 attach（tmux 外），之後回到 dash。
+- fzf 透過 `~/.tmux-manager/run/` 裡的 socket 控制（僅擁有者可存取）。按 Esc、Ctrl-C、關閉 popup 或結束 dash 行程時，背景的更新迴圈也會一併結束。
+- 需要 `curl`。
+
+### `tm state-count`
+
+給狀態列用的 agent 數量；數量為 0 的項目省略，沒有 agent 或沒有 tmux server 時不輸出任何東西。
+
+```
+$ tm state-count
+#[fg=red]❓2#[default] ⏳3 💤5
+$ tm state-count --format plain
+❓2 ⏳3 💤5
+```
+
+```
+# ~/.tmux.conf
+set -g status-interval 5
+set -g status-right '#(tm state-count) | %H:%M'
+```
+
+資料來源與主選單相同（狀態檔加一次 `tmux list-panes`）；逾時的 `working` 也算進 ⏳。tmux 以非同步方式執行 `#()`，不會拖慢畫面。
+
+### 推播通知
+
+設定 `TM_NOTIFY_CMD` 後，`tm hook-state` 在狀態轉換時會執行它。tm.sh 本身不綁定任何通知服務。
+
+| 變數 | 預設 | 意義 |
+|------|------|------|
+| `TM_NOTIFY_CMD` | （未設定時不通知） | Shell 指令；stdin 收到一行 agent JSON，格式同 `tm ls --json` 的 `agents[]`，另加 `host` 與 `tmux_session`（`pid` 為 `null`） |
+| `TM_NOTIFY_ON` | `blocked` | 要通知的狀態，逗號分隔：`blocked`、`idle`、`working`、`dead`。設為 `blocked,idle` 時，一輪結束也會通知 |
+
+- 只有狀態**轉換**才通知，同一狀態重複寫入不會。`idle` 只在 `working` 之後通知（一輪結束），啟動 session 時不會。
+- 同一個 pane 每分鐘最多通知一次，權限確認連續出現時不會洗版。
+- 通知指令在背景執行並有 5 秒 timeout（逾時會終止它的整個 process group），hook 不會等它。
+- 失敗（逾時、非 0 exit）會記到 `~/.tmux-manager/notify.log`（僅擁有者可讀），內容只有時間、pane、狀態與結果，不記錄訊息內容。
+- `TM_NOTIFY_CMD` 從 Claude Code 執行時的環境變數讀取，請在啟動 Claude 的環境中 export。
+
+Telegram 範例，可直接接既有的 bot：
+
+```bash
+export TM_NOTIFY_CMD='jq -r "\(.host)/\(.tmux_session) \(.state): \(.message // "")" \
+  | curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+      --data-urlencode chat_id=$TG_CHAT --data-urlencode text@-'
+```
+
+通知的 `message` 可能含指令內容或路徑，送到外部服務前要確認可接受；必要時只送 session 名稱與狀態。
+
 ## 防呆機制
 
 三道防線，防止誤殺 session：
@@ -382,6 +446,8 @@ tm wait --all --until done --after-change --match any
 | `TM_SNAPSHOT_KEEP` | `48`                 | `tm save` 保留的帶時間戳快照份數 |
 | `TM_SORT`          | （未設定）            | 設為 `recent` 時不把 blocked 排到最上面 |
 | `TM_STALE_AFTER`   | `1800`               | working 超過幾秒沒有 hook 更新就顯示 `⏳?` |
+| `TM_NOTIFY_CMD`    | （未設定）           | agent 狀態轉換時執行的指令（見推播通知） |
+| `TM_NOTIFY_ON`     | `blocked`            | 要通知的狀態，逗號分隔 |
 
 ---
 

@@ -317,7 +317,7 @@ tm wait --all --until done --after-change --match any
 建議的 tmux 綁定：
 
 ```
-bind D display-popup -w 90% -h 85% -E "tm dash"
+bind D display-popup -w 90% -h 85% -E "tm dash --popup"
 # 或常駐在專用 window
 bind W new-window -n dash "tm dash"
 ```
@@ -358,6 +358,16 @@ export TM_NOTIFY_CMD='jq -r "\(.host)/\(.tmux_session) \(.state): \(.message // 
 
 Notification 的 `message` 可能含指令內容或路徑，送到外部服務前要確認可接受；必要時只送 session 名稱與狀態。
 
+### PR 4 決定
+
+- **state-count**：用 fzf 列表的 `_agent_states`（狀態檔加一次 `tmux list-panes`，不跑 ps）；逾時的 working 算進 ⏳，`unknown`、`dead` 不計；任何錯誤都輸出空字串、exit 0，只有 `--format` 不合法時 exit 3。30 個 session 實測 39 ms，未達 30 ms：python3 啟動 18 ms、`import json` 6 ms、bash 解析 tm.sh 10 ms、tmux 7 ms，用 python 無法再降；要達標只能用純 bash 重寫狀態檔判斷，會與共用的判斷規則分岔，所以先維持。
+- **dash 的控制通道**：fzf `--listen=<Unix socket>`，放在 `~/.tmux-manager/run/`（0700），因為 `reload(...)` 會執行指令，TCP port 任何本機使用者都能連。監看迴圈送出 `transform:tm _dash-reload {2}`，回傳 `reload-sync(...)+pos(n)` 讓游標留在原本的 session；`transform(...)` 的括號寫法會在內層第一個 `)` 截斷，所以用冒號寫法。
+- **dash 的結束**：bash 在前景指令執行時會延後處理 trap，所以 fzf 在背景執行、bash 以 `wait` 等待；INT、TERM、HUP 時透過 socket 送 `abort`。監看迴圈在 dash 行程消失時也會 abort fzf 並結束。fzf 的輸出寫到 `run/dash-<pid>.out`，結束時與殘留的 socket 一起移除。
+- **popup**：tmux 無法可靠判斷程式是否在 popup 內，改用 `tm dash --popup`：Enter 後 switch-client 並結束。
+- **preview**：主選單與 dash 共用；blocked pane 顯示最後 15 個非空白行，並移除控制字元。
+- **推播的轉換**：舊狀態存在且不同才算轉換；`idle` 只在舊狀態為 `working` 時通知。頻率限制記在狀態檔新增的 `notified_at`。
+- **推播的執行**：hook 寫完狀態檔後以 `start_new_session` 啟動 `tm _notify`，hook 不等待；`_notify` 用一次 `tmux display-message` 補上 `target` 與 `tmux_session`，`pid` 為 `null`。指令在自己的 process group 執行，逾時 5 秒整組終止。只有失敗寫 log（時間、pane、狀態、結果，不含 message）。沒有設定 `TM_NOTIFY_CMD` 時 hook 延遲 36 ms。
+
 ## 實作順序與待確認問題
 
 依相依順序分四個 PR，每個都能獨立合併、獨立使用。
@@ -365,7 +375,7 @@ Notification 的 `message` 可能含指令內容或路徑，送到外部服務�
 - [x] **PR 1 狀態檔**：`tm hook-state`、擴充 `install-claude-hook`、fzf 的 `ST` 欄與 blocked 置頂、`tm save` 清理孤兒狀態檔
 - [x] **PR 2 機器介面**：`tm ls --json` 與篩選參數、exit code 約定、zsh completion 補上新參數
 - [x] **PR 3 等待原語**：`tm wait` 含 `--after-change` 與 inotify 模式，README 補上 Leader 使用範例
-- [ ] **PR 4 總覽與通知**：`tm dash`、`tm state-count`、`TM_NOTIFY_CMD` 推播，README 補上 tmux 綁定與 Telegram 範例
+- [x] **PR 4 總覽與通知**：`tm dash`、`tm state-count`、`TM_NOTIFY_CMD` 推播，README 補上 tmux 綁定與 Telegram 範例
 
 待確認問題：
 

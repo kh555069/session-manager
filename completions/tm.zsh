@@ -42,6 +42,8 @@ _tm() {
     'rename:Rename a session'
     'ls:List all sessions'
     'wait:Wait for an agent state'
+    'dash:Auto-refreshing session overview'
+    'state-count:Agent counts for the tmux status line'
     'last:Switch to last session'
     'templates:List available templates'
     'protect:Toggle session protection'
@@ -122,6 +124,14 @@ _tm() {
         '--match[With several agents: any or all]:match:(any all)' \
         '--after-change[Only accept states entered after the call]' \
         '1:session:_tm_sessions' && ret=0
+      ;;
+    dash)
+      _arguments -s \
+        '--popup[Exit after switching (for tmux display-popup)]' && ret=0
+      ;;
+    state-count)
+      _arguments -s \
+        '--format[Output format]:format:(tmux plain)' && ret=0
       ;;
     last|templates|tpl|summarize-all|save|install-claude-hook|help)
       # No further arguments

@@ -1263,6 +1263,10 @@ ${C_BOLD}Usage:${C_RESET}
   tm wait <target>|--all --until idle|blocked|done|dead [--timeout 30m] [--interval 2]
           [--match any|all] [--after-change]
                         Block until agents reach a state (exit 1: timeout, 2: gone/dead, 3: bad arguments)
+  tm dash [--popup]     Session list that refreshes when agent states change
+                        (--popup: exit after switching, for tmux display-popup)
+  tm state-count [--format tmux|plain]
+                        Agent counts for the tmux status line, e.g. ❓2 ⏳3 💤5
   tm templates          List available templates
   tm protect <name>     Toggle protection status
   tm summarize <name>   Generate AI summary for a session
@@ -1296,6 +1300,9 @@ ${C_BOLD}Environment variables:${C_RESET}
   TM_SORT            Set to 'recent' to stop floating blocked agents to the top
   TM_STALE_AFTER     Seconds without a hook update before working shows as ⏳?
                      Default: 1800
+  TM_NOTIFY_CMD      Command run on agent state transitions; gets the agent JSON on stdin
+  TM_NOTIFY_ON       Transitions to notify: blocked, idle, working, dead (comma-separated)
+                     Default: blocked
 EOF
 }
 
