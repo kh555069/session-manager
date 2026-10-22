@@ -2145,7 +2145,7 @@ _cmd_hook_state() {
   python3 -I -S -c '
 import json, os, sys, time
 
-state, pane, state_dir = sys.argv[1:]
+state, pane, state_dir, self_path = sys.argv[1:]
 try:
     payload = json.loads(sys.stdin.read() or "null")
 except ValueError:
@@ -2177,13 +2177,32 @@ path = os.path.join(state_dir, pane.lstrip("%") + ".json")
 now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 since = now
+old_state = notified_at = None
 try:
     with open(path) as f:
         old = json.load(f)
-    if isinstance(old, dict) and old.get("state") == state and old.get("since"):
-        since = old["since"]
+    if isinstance(old, dict):
+        old_state = old.get("state")
+        notified_at = old.get("notified_at")
+        if old_state == state and old.get("since"):
+            since = old["since"]
 except (OSError, ValueError):
     pass
+
+# Notify on a transition into a TM_NOTIFY_ON state, at most once a minute per
+# pane; idle counts only after working (a finished turn, not SessionStart)
+notify = False
+if os.environ.get("TM_NOTIFY_CMD") and old_state and old_state != state:
+    wanted = set(s.strip() for s in os.environ.get("TM_NOTIFY_ON", "blocked").split(","))
+    if state in wanted and (state != "idle" or old_state == "working"):
+        import calendar  # only on this rare path: keeps the hook under 50 ms
+        try:
+            last = calendar.timegm(time.strptime(notified_at, "%Y-%m-%dT%H:%M:%SZ"))
+        except (TypeError, ValueError, OverflowError):
+            last = None
+        if last is None or time.time() - last >= 60:
+            notify = True
+            notified_at = now
 
 record = {
     "v": 1,
@@ -2197,6 +2216,7 @@ record = {
     "cwd": payload.get("cwd"),
     "ts": now,
     "since": since,
+    "notified_at": notified_at,
 }
 # Readers glob *.json, so the temp name must not end in .json
 tmp = f"{path}.{os.getpid()}.tmp"
@@ -2204,8 +2224,95 @@ fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 with os.fdopen(fd, "w") as f:
     json.dump(record, f)
 os.replace(tmp, path)
-' "$state" "$TMUX_PANE" "$STATE_DIR" 2>/dev/null || true
+
+if notify:
+    # Detached: the hook never waits for the notify command
+    import subprocess
+    child = subprocess.Popen([self_path, "_notify"], stdin=subprocess.PIPE,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True, close_fds=True)
+    child.stdin.write(json.dumps(record).encode())
+    child.stdin.close()
+' "$state" "$TMUX_PANE" "$STATE_DIR" "$SELF" 2>/dev/null || true
   return 0
+}
+
+# Detached child of tm hook-state: send one state transition to TM_NOTIFY_CMD.
+# Reads the hook's state record on stdin; the command gets the agent as JSON
+# (tm ls --json agents[] format plus host and tmux_session) on its stdin.
+# Failures go to ~/.tmux-manager/notify.log, never to the hook.
+_cmd_notify() {
+  command -v python3 &>/dev/null || return 0
+  exec python3 -I -S -c '
+import json, os, signal, socket, subprocess, sys, time
+
+log_path = sys.argv[1]
+cmd = os.environ.get("TM_NOTIFY_CMD")
+try:
+    record = json.load(sys.stdin)
+except ValueError:
+    record = None
+if not cmd or not isinstance(record, dict):
+    sys.exit(0)
+pane = record.get("pane")
+
+def log(result):
+    # No message text in the log: it may hold commands or paths
+    line = "\t".join([time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                      str(pane), str(record.get("state")), result]) + "\n"
+    try:
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+tmux_session = target = None
+try:
+    out = subprocess.run(["tmux", "display-message", "-p", "-t", str(pane),
+                          "#{session_name}\t#{session_name}:#{window_index}.#{pane_index}"],
+                         capture_output=True, text=True, timeout=2)
+    if out.returncode == 0 and "\t" in out.stdout:
+        tmux_session, target = out.stdout.rstrip("\n").split("\t", 1)
+except (OSError, subprocess.TimeoutExpired):
+    pass
+
+agent = {
+    "pane": pane,
+    "target": target,
+    "agent": record.get("agent"),
+    "pid": None,
+    "session_id": record.get("session_id"),
+    "state": record.get("state"),
+    "stale": False,
+    "since": record.get("since"),
+    "reason": record.get("reason"),
+    "message": record.get("message"),
+    "source": "hook",
+    "host": socket.gethostname().split(".")[0] or None,
+    "tmux_session": tmux_session,
+}
+try:
+    # Own process group, so a timeout also ends the commands it started
+    child = subprocess.Popen(["/bin/sh", "-c", cmd], stdin=subprocess.PIPE,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+except OSError as error:
+    log("error: " + error.__class__.__name__)
+    sys.exit(0)
+try:
+    child.communicate((json.dumps(agent, ensure_ascii=False) + "\n").encode(), timeout=5)
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    child.wait()
+    log("timeout")
+    sys.exit(0)
+if child.returncode != 0:
+    log("exit " + str(child.returncode))
+' "${CONFIG_DIR}/notify.log"
 }
 
 # Safely merge tm's session recorder and agent state hooks into the user's
@@ -3146,6 +3253,7 @@ case "${1:-}" in
   _summarize)      _cmd_summarize "${2:-}" ;;
   _record-claude-session) _cmd_record_claude_session ;;
   hook-state)      _cmd_hook_state "${2:-}" ;;
+  _notify)         _cmd_notify ;;
 
   # User-facing CLI commands (only need tmux, not fzf)
   new|create)      _check_cmd tmux; _cmd_quick_new "${@:2}" ;;
