@@ -54,4 +54,21 @@ test_save_keeps_state_when_none_orphan() {
   assert_not_contains "$("$TM" save)" "Removed" message
 }
 
+test_preview_shows_blocked_screen() {
+  tmux new-session -d -s a -c "$TEST_TMP" "printf 'line-%s\n' \$(seq 1 30); printf 'Allow Bash? \033[31m(y/n)\033[0m\n'; sleep 600"
+  sleep 0.3
+  set_state a blocked '{"notification_type":"permission_prompt"}'
+  local out; out=$("$TM" _preview a | sed 's/\x1b\[[0-9;]*m//g')
+  assert_contains "$out" "Allow Bash? (y/n)" last-line
+  assert_contains "$out" "line-30" within-15
+  assert_not_contains "$out" "line-10" older-lines-cut
+}
+
+test_preview_no_screen_for_idle() {
+  tmux new-session -d -s a -c "$TEST_TMP" "echo SCREEN-MARKER; sleep 600"
+  sleep 0.3
+  set_state a idle
+  assert_not_contains "$("$TM" _preview a)" "SCREEN-MARKER" idle
+}
+
 run_tests

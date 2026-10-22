@@ -652,6 +652,18 @@ _cmd_preview() {
         # printf, not echo -e: the message is agent text and may contain backslashes
         printf '     %s%s%s\n' "$C_DIM" "$a_message" "$C_RESET"
       fi
+      if [[ "$a_state" == "blocked" ]]; then
+        # Last 15 screen lines show what the agent is asking without attaching;
+        # control characters are dropped so pane text cannot drive the terminal
+        local screen_line
+        while IFS= read -r screen_line; do
+          printf '     %s%s%s\n' "$C_DIM" "$screen_line" "$C_RESET"
+        done < <(tmux capture-pane -p -t "$a_pane" 2>/dev/null \
+          | awk '{ l[NR] = $0 } END {
+                   n = NR; while (n > 0 && l[n] ~ /^[[:space:]]*$/) n--
+                   for (i = (n > 15 ? n - 14 : 1); i <= n; i++) print l[i] }' \
+          | LC_ALL=C tr -d '\000-\010\013-\037\177')
+      fi
     done <<< "$agent_lines"
   fi
 
