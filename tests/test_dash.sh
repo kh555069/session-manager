@@ -125,4 +125,48 @@ test_ctrl_c_in_prompt_keeps_dash() {
   [[ -n "$(curl -s --max-time 2 --unix-socket "$DASH_SOCK" http://localhost)" ]] || fail "dash quit on Ctrl-C in a prompt"
 }
 
+test_dash_with_space_in_path() {
+  mkdir -p "$TEST_TMP/my tools"
+  cp "$TM" "$TEST_TMP/my tools/tm.sh"; ln -s "$REPO_ROOT/fzf" "$TEST_TMP/my tools/fzf"
+  TM="$TEST_TMP/my tools/tm.sh"
+  new_session a
+  tmux new-session -d -s dash -x 120 -y 40 "'$TM' dash"
+  local i; for i in $(seq 50); do DASH_SOCK=$(ls "$HOME"/.tmux-manager/run/dash-*.sock 2>/dev/null | head -1); [[ -n "$DASH_SOCK" ]] && break; sleep 0.1; done
+  [[ -n "$DASH_SOCK" ]] || fail "dash socket not found"
+  sleep 0.5
+  set_state a blocked
+  sleep 3
+  assert_contains "$(fzf_state '[m["text"] for m in d["matches"]]')" "❓" reload-works
+}
+
+test_dash_sweeps_dead_dash_files() {
+  mkdir -p "$HOME/.tmux-manager/run"
+  local dead=99999; while kill -0 "$dead" 2>/dev/null; do dead=$((dead - 1)); done
+  touch "$HOME/.tmux-manager/run/dash-$dead.out" "$HOME/.tmux-manager/run/dash-$dead.list"
+  new_session a
+  start_dash
+  [[ ! -e "$HOME/.tmux-manager/run/dash-$dead.out" ]] || fail "stale out file kept"
+}
+
+test_dash_sweeps_reused_pid_files() {
+  mkdir -p "$HOME/.tmux-manager/run"
+  sleep 600 &
+  local other=$!
+  touch "$HOME/.tmux-manager/run/dash-$other.out"
+  new_session a
+  start_dash
+  kill "$other"
+  # The pid is alive but is not a tm dash, so the file is someone else's leftover
+  [[ ! -e "$HOME/.tmux-manager/run/dash-$other.out" ]] || fail "file of a reused pid kept"
+}
+
+test_dash_keeps_files_of_live_dash() {
+  new_session a
+  start_dash
+  local first="$DASH_SOCK"
+  tmux new-session -d -s dash2 -x 120 -y 40 "$TM dash"
+  sleep 1.5
+  [[ -S "$first" ]] || fail "second dash removed the first dash's socket"
+}
+
 run_tests

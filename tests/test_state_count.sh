@@ -48,4 +48,16 @@ test_bad_format_exit_3() {
   assert_eq 3 "$code" exit
 }
 
+test_format_without_value_exit_3() {
+  local code; "$TM" state-count --format >/dev/null 2>&1; code=$?
+  assert_eq 3 "$code" exit
+}
+
+test_linked_window_counted_once() {
+  new_session a; new_session b
+  set_state a blocked
+  tmux link-window -s a:0 -t b:9
+  assert_eq "❓1" "$("$TM" state-count --format plain)" once
+}
+
 run_tests

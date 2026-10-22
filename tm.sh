@@ -31,6 +31,9 @@ else
   [[ "$_self" != /* ]] && _self="${PWD}/${_self}"
 fi
 readonly SELF="$_self"
+# SELF escaped for the shell fzf runs its actions in (a path may hold spaces)
+printf -v _SELF_Q '%q' "$SELF"
+readonly _SELF_Q
 readonly CONFIG_DIR="${HOME}/.tmux-manager"
 readonly PROTECTED_FILE="${CONFIG_DIR}/protected.txt"
 readonly CLAUDE_SESSION_MAP="${CONFIG_DIR}/claude_sessions.jsonl"
@@ -333,7 +336,9 @@ _cmd_state_count() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --format=*) format="${1#*=}" ;;
-      --format)   format="${2:-}"; shift ;;
+      --format)
+        [[ $# -ge 2 ]] || { echo "Usage: tm state-count [--format tmux|plain]" >&2; exit 3; }
+        format="$2"; shift ;;
       *) echo "Usage: tm state-count [--format tmux|plain]" >&2; exit 3 ;;
     esac
     shift
@@ -344,8 +349,11 @@ _cmd_state_count() {
   esac
   command -v tmux &>/dev/null || return 0
 
-  local blocked=0 working=0 idle=0 _target _pane st _rest
-  while IFS=$'\t' read -r _target _pane st _rest; do
+  local blocked=0 working=0 idle=0 _target pane st _rest seen=$'\n'
+  while IFS=$'\t' read -r _target pane st _rest; do
+    # A window linked into several sessions lists its panes once per session
+    [[ "$seen" == *$'\n'"$pane"$'\n'* ]] && continue
+    seen+="$pane"$'\n'
     case "$st" in
       blocked)          blocked=$((blocked + 1)) ;;
       working|working\?) working=$((working + 1)) ;;
@@ -609,10 +617,12 @@ _cmd_preview() {
   idle_str=$(_relative_time "$activity")
 
   echo -e "${C_BOLD}── Session Details ──────────────────${C_RESET}"
-  echo -e "🏷️  ${C_CYAN}${name}${C_RESET}"
-  echo -e "📂 ${path/#$HOME/~}"
+  # Names, paths, branches, summaries, window names and commands are outside
+  # text: printf %s keeps their backslashes literal (echo -e would expand them)
+  printf '🏷️  %s%s%s\n' "$C_CYAN" "$name" "$C_RESET"
+  printf '📂 %s\n' "${path/#$HOME/~}"
   if [[ -n "$git_branch" ]]; then
-    echo -e "🌿 ${C_GREEN}${git_branch}${C_RESET}"
+    printf '🌿 %s%s%s\n' "$C_GREEN" "$git_branch" "$C_RESET"
   fi
   echo -e "🪟 ${windows} win · ${panes} pane · ${clients} client"
   echo -e "🕒 ${created_fmt} · idle ${idle_str}"
@@ -631,7 +641,7 @@ _cmd_preview() {
       if [[ -n "$last_summary" && "$last_summary" != "$last_line" ]]; then
         local summary_age
         summary_age=$(_relative_time "$last_ts")
-        echo -e "💡 ${last_summary} ${C_DIM}(${summary_age})${C_RESET}"
+        printf '💡 %s %s(%s)%s\n' "$last_summary" "$C_DIM" "$summary_age" "$C_RESET"
       fi
     fi
   fi
@@ -650,9 +660,9 @@ _cmd_preview() {
       a_label="$a_state"
       [[ "$a_reason" != "-" ]] && a_label+=" (${a_reason})"
       if [[ "$a_state" == "blocked" ]]; then
-        echo -e "  ${_STATE_ICON} ${a_target}  ${C_RED}${a_label}${C_RESET} · $(_relative_time "$a_since")"
+        printf '  %s %s  %s%s%s · %s\n' "$_STATE_ICON" "$a_target" "$C_RED" "$a_label" "$C_RESET" "$(_relative_time "$a_since")"
       else
-        echo -e "  ${_STATE_ICON} ${a_target}  ${a_label} · $(_relative_time "$a_since")"
+        printf '  %s %s  %s · %s\n' "$_STATE_ICON" "$a_target" "$a_label" "$(_relative_time "$a_since")"
       fi
       if [[ "$a_state" == "blocked" && "$a_message" != "-" ]]; then
         # printf, not echo -e: the message is agent text and may contain backslashes
@@ -699,7 +709,7 @@ _cmd_preview() {
       all_pids+=("$pid")
 
       # Show shell process with resource usage
-      echo -e "  ${C_DIM}▸ ${shell_cmd}  (${pid})  CPU ${shell_cpu:-0.0}% · RAM ${shell_mem}${C_RESET}"
+      printf '  %s▸ %s  (%s)  CPU %s%% · RAM %s%s\n' "$C_DIM" "$shell_cmd" "$pid" "${shell_cpu:-0.0}" "$shell_mem" "$C_RESET"
 
       # Show child if foreground process differs from shell
       if [[ "$fg_cmd" != "$shell_cmd" && "$fg_cmd" != "-${shell_cmd}" ]]; then
@@ -720,9 +730,9 @@ _cmd_preview() {
           all_pids+=("$child_pid")
 
           if [[ "$display_cmd" =~ $IMPORTANT_PROCS ]]; then
-            echo -e "    ${C_YELLOW}└─ ${display_cmd}  ${C_DIM}(${child_pid})  CPU ${child_cpu:-0.0}% · RAM ${child_mem}${C_RESET}"
+            printf '    %s└─ %s  %s(%s)  CPU %s%% · RAM %s%s\n' "$C_YELLOW" "$display_cmd" "$C_DIM" "$child_pid" "${child_cpu:-0.0}" "$child_mem" "$C_RESET"
           else
-            echo -e "    ${C_DIM}└─ ${display_cmd}  (${child_pid})  CPU ${child_cpu:-0.0}% · RAM ${child_mem}${C_RESET}"
+            printf '    %s└─ %s  (%s)  CPU %s%% · RAM %s%s\n' "$C_DIM" "$display_cmd" "$child_pid" "${child_cpu:-0.0}" "$child_mem" "$C_RESET"
           fi
         fi
       fi
@@ -744,7 +754,7 @@ _cmd_preview() {
   echo -e "${C_BOLD}── Window List ─────────────────────${C_RESET}"
 
   while IFS= read -r line; do
-    echo -e "  ${line}"
+    printf '  %s\n' "$line"
   done < <(tmux list-windows -t "$name" \
     -F '#{window_index}: #{window_name} #{?window_active,(active),}' 2>/dev/null)
 }
@@ -1053,15 +1063,15 @@ _fzf_menu() {
         --header-lines=1 \
         --delimiter=$'\t' \
         --with-nth="$fzf_with_nth" \
-        --preview="$SELF _preview {2}" \
+        --preview="$_SELF_Q _preview {2}" \
         --preview-window="down:50%:wrap" \
         --bind="tab:toggle+down" \
-        --bind="ctrl-n:execute($SELF _create </dev/tty >/dev/tty)+reload($SELF _list)" \
-        --bind="ctrl-k:execute($SELF _kill-selected {+2} </dev/tty >/dev/tty)+reload($SELF _list)" \
-        --bind="ctrl-e:execute($SELF _rename {2} </dev/tty >/dev/tty)+reload($SELF _list)" \
-        --bind="ctrl-d:execute($SELF _detach-others {2} </dev/tty >/dev/tty)+reload($SELF _list)" \
-        --bind="ctrl-p:execute-silent($SELF _toggle-protect {2})+reload($SELF _list)" \
-        --bind="ctrl-r:reload($SELF _list)" \
+        --bind="ctrl-n:execute($_SELF_Q _create </dev/tty >/dev/tty)+reload($_SELF_Q _list)" \
+        --bind="ctrl-k:execute($_SELF_Q _kill-selected {+2} </dev/tty >/dev/tty)+reload($_SELF_Q _list)" \
+        --bind="ctrl-e:execute($_SELF_Q _rename {2} </dev/tty >/dev/tty)+reload($_SELF_Q _list)" \
+        --bind="ctrl-d:execute($_SELF_Q _detach-others {2} </dev/tty >/dev/tty)+reload($_SELF_Q _list)" \
+        --bind="ctrl-p:execute-silent($_SELF_Q _toggle-protect {2})+reload($_SELF_Q _list)" \
+        --bind="ctrl-r:reload($_SELF_Q _list)" \
         --bind="ctrl-q:abort" \
         --color="bg+:#283457,fg:#c0caf5,fg+:#c0caf5,hl:#ff9e64,hl+:#ff9e64" \
         --color="header:#565f89,info:#7aa2f7,pointer:#7dcfff,marker:#9ece6a" \
@@ -1133,6 +1143,7 @@ _cmd_dash() {
   # fzf actions over this socket run commands, so it lives in a private dir
   local run_dir="${CONFIG_DIR}/run"
   mkdir -p "$run_dir" && chmod 700 "$run_dir"
+  _dash_sweep "$run_dir"
   _DASH_SOCK="${run_dir}/dash-$$.sock"
   _DASH_OUT="${run_dir}/dash-$$.out"
   _DASH_LIST="${run_dir}/dash-$$.list"
@@ -1170,6 +1181,24 @@ _cmd_dash() {
     fi
     [[ $popup -eq 1 ]] && break
   done
+}
+
+# Remove run/ files left by a dash that is gone (e.g. killed with SIGKILL). A
+# pid that is alive but is not a tm dash was reused, so its files are stale too.
+# Only dash-<pid>.{sock,out,list} names are touched.
+_dash_sweep() {
+  local dir="$1" f base pid args
+  local is_dash='(^|/)tm(\.sh)? dash( |$)'
+  for f in "$dir"/dash-*.sock "$dir"/dash-*.out "$dir"/dash-*.list; do
+    [[ -e "$f" ]] || continue
+    base="${f##*/dash-}"
+    pid="${base%.*}"
+    [[ "$pid" =~ ^[0-9]+$ && "$pid" != "$$" ]] || continue
+    args=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    [[ "$args" =~ $is_dash ]] && continue
+    rm -f "$f"
+  done
+  return 0
 }
 
 # Wait until fzf has really exited: a trapped signal interrupts `wait` early.
@@ -1233,7 +1262,7 @@ _dash_watch() {
       exit 0
     fi
     curl -s --max-time 2 --unix-socket "$sock" -XPOST http://localhost \
-      -d "transform:$SELF _dash-reload {2} $dash_pid" >/dev/null 2>&1 || exit 0
+      -d "transform:$_SELF_Q _dash-reload {2} $dash_pid" >/dev/null 2>&1 || exit 0
   done
 }
 
@@ -1248,12 +1277,13 @@ _cmd_dash_reload() {
   [[ "${FZF_SELECT_COUNT:-0}" =~ ^[0-9]+$ && "${FZF_SELECT_COUNT:-0}" -gt 0 ]] && return 0
 
   list=$("$SELF" _list)
-  local reload="reload-sync($SELF _list)"
+  local reload="reload-sync($_SELF_Q _list)"
   if [[ -n "$dash_pid" ]]; then
     list_file="${CONFIG_DIR}/run/dash-${dash_pid}.list"
     [[ -f "$list_file" && "$(<"$list_file")" == "$list" ]] && return 0
     ( umask 077; printf '%s\n' "$list" > "$list_file" )
-    reload="reload-sync(cat '$list_file')"
+    local list_q; printf -v list_q '%q' "$list_file"
+    reload="reload-sync(cat $list_q)"
   fi
 
   rows=$(sed 1d <<< "$list")  # without the header line
