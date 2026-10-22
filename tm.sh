@@ -1071,6 +1071,9 @@ ${C_BOLD}Usage:${C_RESET}
   tm ls --json [--state <s>[,<s>]] [--agent <name>] [--session <name>] [--no-summary]
                         Machine-readable sessions and agent states
                         (exit 2: no such session, 3: bad arguments, 4: no tmux server)
+  tm wait <target>|--all --until idle|blocked|done|dead [--timeout 30m] [--interval 2]
+          [--match any|all] [--after-change]
+                        Block until agents reach a state (exit 1: timeout, 2: gone/dead, 3: bad arguments)
   tm templates          List available templates
   tm protect <name>     Toggle protection status
   tm summarize <name>   Generate AI summary for a session

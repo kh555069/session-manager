@@ -276,6 +276,17 @@ tm wait --all --until done --after-change --match any
 - 純 Bash 即可實作；讀單一欄位時用 python3 one-liner 或 `jq`（有就用），避免每輪啟動完整解析。
 - 收到 SIGINT 時乾淨退出並回傳 130，不留下暫存檔。
 
+### PR 3 決定
+
+- **實作**：bash 驗證參數後 `exec` 單一 python3 迴圈，每輪呼叫 tmux、ps 各一次。agent 判斷與 `tm ls --json` 共用 `_PY_SNAPSHOT_LIB`，包括「要有行程才採信 hook 狀態」。python 自行安裝 SIGINT handler（背景 job 會繼承忽略 SIGINT），SIGTERM 回 143，兩者都會先結束 `inotifywait` 子行程。
+- **Target**：`%N`、`name:W.P`、`name:W`（整個 window）、session 名稱；`--all` 是所有目前有 agent 的 pane。開始時解析不到、tmux server 未啟動 → exit 2。
+- **尚未就緒**：pane 存在但還沒有 agent 時繼續等，不算 dead。
+- **Dead**：等待中曾看到有 `pid` 的 agent，之後 pane 消失、agent 不見或 `pid` 變成 `null`（涵蓋 `kill -9`）。輸出最後一次看到的 agent，`state` 改為 `dead`。
+- **條件**：`unknown`（含 heuristic）不符合 `idle`、`blocked`、`done`；`stale` 的 working 仍是 working。`--match all` 只計算有 agent 的 pane。
+- **`--after-change`**：記下開始時每個 pane 的 `since`，只採信 `since` 存在且不同的狀態；`since` 只到秒，用「不同」而非「較新」比對。
+- **逾時**：exit 1，stdout 印出所有 agent 目前的狀態。
+- **inotify**：`inotifywait -qq -t <ceil(interval)>` 監看狀態目錄，逾時保證每輪仍檢查 pane；`interval < 1` 或目錄不存在時直接 sleep。
+
 ## 4. 狀態總覽與通知
 
 三個出口都只讀第 1 節的狀態檔，不新增資料來源：`tm dash` 給坐在電腦前的人看，`tm state-count` 放在 tmux 狀態列，推播負責離開畫面時的提醒。
@@ -346,7 +357,7 @@ Notification 的 `message` 可能含指令內容或路徑，送到外部服務�
 
 - [x] **PR 1 狀態檔**：`tm hook-state`、擴充 `install-claude-hook`、fzf 的 `ST` 欄與 blocked 置頂、`tm save` 清理孤兒狀態檔
 - [x] **PR 2 機器介面**：`tm ls --json` 與篩選參數、exit code 約定、zsh completion 補上新參數
-- [ ] **PR 3 等待原語**：`tm wait` 含 `--after-change` 與 inotify 模式，README 補上 Leader 使用範例
+- [x] **PR 3 等待原語**：`tm wait` 含 `--after-change` 與 inotify 模式，README 補上 Leader 使用範例
 - [ ] **PR 4 總覽與通知**：`tm dash`、`tm state-count`、`TM_NOTIFY_CMD` 推播，README 補上 tmux 綁定與 Telegram 範例
 
 待確認問題：

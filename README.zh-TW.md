@@ -271,6 +271,95 @@ tm ls --json --state blocked | jq -r '.sessions[].agents[] | select(.state == "b
 tm ls --json --session web-app --no-summary | jq '.sessions[0].agents[] | {target, state, reason}'
 ```
 
+## 等待 Agent（`tm wait`）
+
+`tm wait` 阻塞到 agent 達成指定狀態才返回，讓腳本能「派工、等完成、收結果」，不必自己寫輪詢迴圈。
+
+```
+tm wait <target>|--all --until idle|blocked|done|dead [--timeout 30m] [--interval 2] [--match any|all] [--after-change]
+```
+
+| 參數 | 作用 |
+|------|------|
+| `<target>` | session 名稱、pane id（`%12`）或 tmux 位址（`web-app:1.0`；`web-app:1` 表示整個 window） |
+| `--all` | 所有 session 的所有 agent pane（取代 `<target>`） |
+| `--until` | `idle`、`blocked`、`done`（idle 或 blocked，也就是不再 working）或 `dead` |
+| `--match` | 有多個 agent 時：`any`（預設）任一達成即返回，`all` 等全部達成 |
+| `--timeout` | `90s`、`30m`、`2h`（只寫數字視為秒）；預設不逾時 |
+| `--interval` | 輪詢秒數，預設 `2`（可有小數） |
+| `--after-change` | 只接受呼叫之後才進入的狀態（見下方） |
+
+| Exit code | 意義 |
+|-----------|------|
+| `0` | 條件達成 |
+| `1` | 逾時 |
+| `2` | target 不存在，或等待期間有 agent 結束（`--until dead` 除外） |
+| `3` | 參數錯誤 |
+| `130` | 被中斷（Ctrl-C） |
+
+返回時 stdout 每行一個 JSON 物件，格式與 `tm ls --json` 的 `agents[]` 相同。依返回原因，內容是達成條件的 agent、已結束的 agent（`state: "dead"`），或逾時時每個 agent 目前的狀態。
+
+- **送出 prompt 後，搭配 `--after-change` 等待。** 剛送出 prompt 時 hook 可能還沒寫入 `working`，上一輪的 `idle` 會讓 wait 立刻結束。`--after-change` 會忽略呼叫當下 agent 已處於的狀態。
+- **還沒啟動不等於已結束。** agent 還沒啟動的 pane 會繼續等待。agent 必須先被看到在執行，之後 pane 關閉或行程消失，才算結束；這也涵蓋不會觸發結束 hook 的 `kill -9`。
+- **`unknown` 永遠不算完成。** 沒有 hook 狀態的 agent（Codex 或沒裝 hook），以及行程已不存在的 agent，都不符合 `idle`、`blocked`、`done`。
+- **`--match all` 只計算有 agent 的 pane**，session 裡的一般 shell pane 不會讓它一直等下去。
+- PATH 上有 `inotifywait`（inotify-tools，Linux）時，狀態檔一變更就會喚醒；沒有則每 `--interval` 秒輪詢一次。
+
+### Leader 使用範例
+
+範例以 Leader Agent 的派工流程為準（`~/project/catalog-manager` 的 `/dispatch`）：啟動指令由 `worker-session.sh plan` 產生，任務文字一律經 `agent-prompt.sh` 從 stdin 送出，不直接用 `tmux send-keys` 或 `paste-buffer` 注入。`tm wait` 只負責等待，`blocked` 時停下交給使用者，Leader 不代為回答。
+
+```bash
+scripts=~/project/catalog-manager/scripts
+
+# 派工前：session 已存在時，確認裡面沒有既有 Worker
+# （guard 對不存在的 session 回 3，所以先判斷 session 是否存在）
+if tmux has-session -t api-server 2>/dev/null; then
+  guard=$(bash "$scripts/agent-instance-guard.sh" api-server); guard_exit=$?
+  eval "$guard"   # sets COUNT, PANE, INFO, AGENT
+  [ "$guard_exit" -eq 0 ] && [ "$COUNT" -eq 0 ] || exit 1   # 已有 Worker 時改走既有流程或一次性 pane
+else
+  tm new api-server ~/project/api-server
+fi
+
+# 啟動 Worker：指令只能來自 planner，不自行組裝
+plan=$(bash "$scripts/worker-session.sh" plan api-server claude-code ~/project/api-server true) || exit 1
+eval "$plan"    # sets MODE, SESSION_ID, REASON, CMD
+tmux send-keys -t api-server "$CMD" Enter
+
+# 重新跑 guard 取得 Worker 所在 pane，再等它啟動完成
+eval "$(bash "$scripts/agent-instance-guard.sh" api-server)"
+start=$(tm wait "api-server:$PANE" --until done --timeout 60s) || exit 1
+[ "$(jq -r .state <<<"$start")" = blocked ] && { echo "啟動對話框待處理，請 attach"; exit 1; }
+
+# 送出任務：stdin 傳入，避免引號被 shell 解讀
+result=$(printf '%s' '實作 /healthz endpoint 並補上測試' \
+  | bash "$scripts/agent-prompt.sh" api-server "$PANE")
+prompt_exit=$?
+eval "$result"  # sets RESULT, REASON, STATE, RULE
+case $prompt_exit in
+  0) ;;
+  12) echo "prompt_stalled：文字可能還在輸入框，不得重送"; exit 1 ;;
+  *) echo "未送出：$REASON"; exit 1 ;;
+esac
+
+# 等完成或卡住
+result=$(tm wait "api-server:$PANE" --until done --after-change --timeout 45m)
+case $? in
+  0) [ "$(jq -r .state <<<"$result")" = blocked ] \
+       && echo "需要使用者處理：$(jq -r .message <<<"$result")" ;;
+  1) echo "api-server 逾時，仍在 working" ;;
+  2) echo "api-server 已結束" ;;
+esac
+
+# 多個 worker：任一完成就先處理
+tm wait --all --until done --after-change --match any
+```
+
+- 啟動後用 `--until done` 而不是 `idle`：信任資料夾、升級提示等對話框會讓 Worker 停在 `blocked`，只等 `idle` 會一路等到逾時。
+- `agent-prompt.sh` 回 `12` 時文字可能還留在輸入框，重送會變成兩份任務，必須先交給使用者判斷。
+- `tm wait` 是 `agent-state.sh wait` 的候選替代；在 Leader 規則改版前，Worker 狀態判讀仍以 `agent-state.sh` 為準。
+
 ## 防呆機制
 
 三道防線，防止誤殺 session：

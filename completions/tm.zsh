@@ -41,6 +41,7 @@ _tm() {
     'attach:Attach to a session'
     'rename:Rename a session'
     'ls:List all sessions'
+    'wait:Wait for an agent state'
     'last:Switch to last session'
     'templates:List available templates'
     'protect:Toggle session protection'
@@ -111,6 +112,16 @@ _tm() {
         '--agent[Keep only this agent type]:agent:(claude codex)' \
         '--session[Only this session]:session:_tm_sessions' \
         '--no-summary[Skip AI summaries]' && ret=0
+      ;;
+    wait)
+      _arguments -s \
+        '--all[Wait on every agent pane]' \
+        '--until[State to wait for]:state:(idle blocked done dead)' \
+        '--timeout[Give up after (e.g. 90s, 30m, 2h)]:timeout:' \
+        '--interval[Polling interval in seconds]:seconds:' \
+        '--match[With several agents: any or all]:match:(any all)' \
+        '--after-change[Only accept states entered after the call]' \
+        '1:session:_tm_sessions' && ret=0
       ;;
     last|templates|tpl|summarize-all|save|install-claude-hook|help)
       # No further arguments

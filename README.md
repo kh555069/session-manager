@@ -270,6 +270,95 @@ tm ls --json --state blocked | jq -r '.sessions[].agents[] | select(.state == "b
 tm ls --json --session web-app --no-summary | jq '.sessions[0].agents[] | {target, state, reason}'
 ```
 
+## Waiting for Agents (`tm wait`)
+
+`tm wait` blocks until agents reach a state, so a script can dispatch work, wait, and collect the result without its own polling loop.
+
+```
+tm wait <target>|--all --until idle|blocked|done|dead [--timeout 30m] [--interval 2] [--match any|all] [--after-change]
+```
+
+| Option | Effect |
+|--------|--------|
+| `<target>` | A session name, a pane id (`%12`), or a tmux address (`web-app:1.0`, or `web-app:1` for a whole window) |
+| `--all` | Every agent pane in every session (instead of `<target>`) |
+| `--until` | `idle`, `blocked`, `done` (idle or blocked, i.e. no longer working), or `dead` |
+| `--match` | With several agents: `any` (default) returns on the first, `all` waits for every one |
+| `--timeout` | `90s`, `30m`, `2h` (a bare number is seconds); no timeout by default |
+| `--interval` | Polling interval in seconds, default `2` (decimals allowed) |
+| `--after-change` | Only accept a state entered after the call (see below) |
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | Condition met |
+| `1` | Timed out |
+| `2` | The target does not exist, or an agent died while waiting (except with `--until dead`) |
+| `3` | Invalid arguments |
+| `130` | Interrupted (Ctrl-C) |
+
+On return, stdout has one JSON object per agent, in the same format as `tm ls --json` `agents[]`: the agents that met the condition, the ones that died (`state: "dead"`), or, on timeout, the current state of every agent.
+
+- **Send a prompt, then wait with `--after-change`.** Right after a prompt the hook may not have written `working` yet, so the previous turn's `idle` would end the wait at once. `--after-change` ignores the state the agent was already in when `tm wait` started.
+- **Startup is not death.** A pane whose agent has not started yet keeps the wait going. An agent counts as dead once it was seen running and then its pane closed, or its process disappeared — this also catches `kill -9`, which never runs the exit hook.
+- **`unknown` is never done.** Agents without a hook state (Codex, hooks not installed) and agents whose process is gone do not satisfy `idle`, `blocked` or `done`.
+- **`--match all` only counts panes with an agent**, so a plain shell pane in the session does not hold it up.
+- With `inotifywait` (inotify-tools, Linux) on PATH, `tm wait` wakes as soon as a state file changes; otherwise it polls every `--interval` seconds.
+
+### Leader example
+
+This follows the Leader Agent dispatch flow (`/dispatch` in `~/project/catalog-manager`): the start command comes from `worker-session.sh plan`, the task text always goes through `agent-prompt.sh` on stdin rather than `tmux send-keys` or `paste-buffer`, and `tm wait` only waits — on `blocked` the Leader stops and hands over to the user instead of answering for them.
+
+```bash
+scripts=~/project/catalog-manager/scripts
+
+# Before dispatching: if the session exists, make sure it has no Worker yet
+# (the guard returns 3 for a missing session, so check that first)
+if tmux has-session -t api-server 2>/dev/null; then
+  guard=$(bash "$scripts/agent-instance-guard.sh" api-server); guard_exit=$?
+  eval "$guard"   # sets COUNT, PANE, INFO, AGENT
+  [ "$guard_exit" -eq 0 ] && [ "$COUNT" -eq 0 ] || exit 1   # existing Worker: use the existing flow or an ephemeral pane
+else
+  tm new api-server ~/project/api-server
+fi
+
+# Start the Worker: the command only comes from the planner
+plan=$(bash "$scripts/worker-session.sh" plan api-server claude-code ~/project/api-server true) || exit 1
+eval "$plan"    # sets MODE, SESSION_ID, REASON, CMD
+tmux send-keys -t api-server "$CMD" Enter
+
+# Re-run the guard to get the Worker's pane, then wait for it to start
+eval "$(bash "$scripts/agent-instance-guard.sh" api-server)"
+start=$(tm wait "api-server:$PANE" --until done --timeout 60s) || exit 1
+[ "$(jq -r .state <<<"$start")" = blocked ] && { echo "Startup dialog needs attention, please attach"; exit 1; }
+
+# Send the task on stdin so the shell never interprets its quotes
+result=$(printf '%s' 'Implement the /healthz endpoint and add tests' \
+  | bash "$scripts/agent-prompt.sh" api-server "$PANE")
+prompt_exit=$?
+eval "$result"  # sets RESULT, REASON, STATE, RULE
+case $prompt_exit in
+  0) ;;
+  12) echo "prompt_stalled: the text may still be in the input box, do not resend"; exit 1 ;;
+  *) echo "Not sent: $REASON"; exit 1 ;;
+esac
+
+# Wait until it finishes or gets stuck
+result=$(tm wait "api-server:$PANE" --until done --after-change --timeout 45m)
+case $? in
+  0) [ "$(jq -r .state <<<"$result")" = blocked ] \
+       && echo "Needs the user: $(jq -r .message <<<"$result")" ;;
+  1) echo "api-server timed out, still working" ;;
+  2) echo "api-server has exited" ;;
+esac
+
+# Several workers: handle whichever finishes first
+tm wait --all --until done --after-change --match any
+```
+
+- Wait for `done` rather than `idle` after starting: trust-folder, upgrade and similar dialogs leave the Worker `blocked`, and waiting for `idle` alone would run into the timeout.
+- When `agent-prompt.sh` returns `12` the text may still be in the input box; resending would create two tasks, so a person has to decide first.
+- `tm wait` is a candidate replacement for `agent-state.sh wait`; until the Leader rules change, Worker state is still read with `agent-state.sh`.
+
 ## Safety Mechanisms
 
 Three layers of protection to prevent accidental session termination:
