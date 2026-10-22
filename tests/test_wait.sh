@@ -173,4 +173,40 @@ test_until_dead_exit_0() {
   assert_eq dead "$(json 'd["state"]' <<< "$out")" state
 }
 
+# ─── Task 3: inotify wake-up and SIGINT ───────────────
+
+# fake_inotifywait [seconds]: stands in for inotify-tools; reports an event
+# after the delay (default 0.2s)
+fake_inotifywait() {
+  printf '#!/bin/bash\nsleep %s\nexit 0\n' "${1:-0.2}" > "$TEST_TMP/bin/inotifywait"
+  chmod +x "$TEST_TMP/bin/inotifywait"
+}
+
+test_inotify_wakes_before_interval() {
+  fake_inotifywait
+  agent_pane new a
+  set_state a working
+  later 0.5 set_state a idle
+  local code start=$SECONDS
+  PATH="$TEST_TMP/bin:$PATH" "$TM" wait a --until idle --interval 5 --timeout 20s >/dev/null; code=$?
+  wait
+  assert_eq 0 "$code" exit
+  [[ $((SECONDS - start)) -le 3 ]] || fail "took $((SECONDS - start))s with --interval 5"
+}
+
+test_sigint_exits_130() {
+  # A watcher that outlives the test proves SIGINT terminates it
+  fake_inotifywait 30
+  agent_pane new a
+  set_state a working
+  PATH="$TEST_TMP/bin:$PATH" "$TM" wait a --until idle --interval 5 >/dev/null 2>&1 &
+  local pid=$!
+  sleep 0.5
+  kill -INT "$pid"
+  local code; wait "$pid"; code=$?
+  assert_eq 130 "$code" exit
+  sleep 0.3
+  assert_eq "" "$(pgrep -f "$TEST_TMP/bin/inotifywait")" no-leftover-watcher
+}
+
 run_tests

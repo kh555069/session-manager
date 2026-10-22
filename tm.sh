@@ -1711,6 +1711,34 @@ def emit(agents):
         sys.stdout.write(json.dumps(agent, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
+import math, shutil, signal
+
+watcher = None
+
+def stop(code):
+    # Never leave an inotifywait child behind
+    if watcher is not None and watcher.poll() is None:
+        watcher.terminate()
+    os._exit(code)
+
+# Installed explicitly: a background job inherits SIGINT as ignored
+signal.signal(signal.SIGINT, lambda signum, frame: stop(130))
+signal.signal(signal.SIGTERM, lambda signum, frame: stop(143))
+inotifywait = shutil.which("inotifywait")
+
+def sleep_until_next(pause):
+    """Sleep up to pause seconds; with inotifywait, wake early on a state file change."""
+    global watcher
+    if inotifywait and pause >= 1 and os.path.isdir(state_dir):
+        watcher = subprocess.Popen(
+            [inotifywait, "-qq", "-t", str(math.ceil(pause)),
+             "-e", "close_write,moved_to,create,delete", state_dir],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        watcher.wait()
+        watcher = None
+    else:
+        time.sleep(pause)
+
 # Agents seen with a live process, by pane; one that later loses its pane,
 # its agent entry or its process is dead (kill -9 never writes a dead state)
 seen = {}
@@ -1761,7 +1789,7 @@ while True:
         sys.exit(1)
     first = False
     pause = interval if deadline is None else max(0.0, min(interval, deadline - now))
-    time.sleep(pause)
+    sleep_until_next(pause)
 ' "$target" "$all" "$until" "$seconds" "$interval" "$match" "$after_change" \
     "$CONFIG_DIR" "$STATE_DIR" "$STALE_AFTER"
 }
