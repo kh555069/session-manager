@@ -396,4 +396,28 @@ Notification 的 `message` 可能含指令內容或路徑，送到外部服務�
 - [x] `PreToolUse` 每次寫檔的實際成本，在密集工具呼叫下是否可接受？先量測再決定是否加短路。
   - 量測（macOS，20–40 次平均）：預設 `python3` 為 54.3 ms；改用 `python3 -I -S` 並移除 `tempfile` 後為 39.4 ms，低於 50 ms，不需要短路。
 - [ ] Subagent（Task tool）的事件是否會覆寫主 agent 的狀態？可能需要忽略 `SubagentStop`，或依 `session_id` 區分。
+  - 文件調查（2026-10-22，Claude Code 2.1.308，hooks 與 sub-agents 官方文件；尚未用真機 log 確認）：
+    - **前景 subagent 不會造成誤判**：主對話會等 subagent 結束；subagent 的工具呼叫同樣觸發 `PreToolUse`／`PostToolUse`（寫入 `working`），輸入帶 `agent_id`、`agent_type`。`Stop` 的說明是「主 agent 回應結束」，subagent 結束送的是 `SubagentStop`。
+    - **背景 subagent 會造成誤判**：從主對話叫出的 subagent 預設在背景執行，主 agent 這一輪的 `Stop` 可能在 subagent 還在跑時就寫入 `idle`，結果在之後的回合才回來。`tm wait --until done` 會因此太早返回；subagent 只在呼叫工具時才會把狀態改回 `working`。
+    - `Stop` 的輸入有 `background_tasks` 欄位（範圍是父 session），可用來判斷還有沒有背景工作。
+    - 主 agent 與 subagent 的 `session_id` 是否相同，文件沒寫；subagent 的 transcript 放在父 session 目錄下，推測相同。
+  - 修正方向（待真機確認後實作）：`Stop` 的 `background_tasks` 非空時不寫 `idle`，改維持 `working`；或另裝 `SubagentStart`／`SubagentStop`，以 `agent_id` 計數，計數大於 0 時不寫 `idle`。兩者都要先用只記錄 stdin 的 hook 實測欄位內容。
+  - 同次調查的其他發現：
+    - `notification_type` 文件列出 13 種，目前只處理 4 種。`elicitation_url_dialog`（MCP 要求開瀏覽器）與 `agent_needs_input`（背景 session 等待輸入）應評估是否算 `blocked`；其餘（`agent_completed`、`quota_auto_resume_*`、`plugin_notification`、`elicitation_complete`、`elicitation_response`）不是等待使用者的訊號。
+    - 權限提示約等 6 秒才送 `permission_prompt`，在那之前會先顯示 `⏳`。
+    - 互動模式下，接受信任對話框之前，所有設定檔的 hook（含 `~/.claude/settings.json`）都不會執行，與 README 的說法一致；`-p` 與 SDK 不顯示對話框、視為已信任。
+    - 使用者拒絕權限或按 Esc 中斷，沒有對應的 hook（`PermissionDenied` 只用於 auto mode），所以 PR 1 記錄的「`❓` 留到下一個 prompt」是已知限制，文件層面無解。
 - [ ] Codex 的 `working` 與 `blocked` 是否有更可靠的訊號，可以取代畫面比對？
+  - 文件與原始碼調查（2026-10-22，codex-cli 0.163.0，官方 hooks／config 文件與 `openai/codex` 的 `rust-v0.163.0` 原始碼；尚未實測）：
+    - **Codex 有與 Claude Code 相容的 hook 系統**，0.163 預設啟用：`~/.codex/hooks.json` 或 `config.toml` 的 `[hooks]`，格式是事件 → matcher → handler，stdin 收 JSON（`session_id`、`cwd`、`hook_event_name`、多數事件有 `turn_id`）。事件有 SessionStart、SessionEnd、PreToolUse、PostToolUse、PermissionRequest、UserPromptSubmit、SubagentStart、SubagentStop、Stop、Interrupt 等。非 managed 的 hook 要在 `/hooks` 審閱信任一次。
+    - **舊的 `notify` 設定**只在 `agent-turn-complete`（一輪正常結束）時呼叫，JSON 放在最後一個 argv，fire-and-forget；原始碼標為 legacy，預期會被 hooks 取代，不建議採用。
+    - **最大的坑：daemon 模式**。0.163 的 TUI 預設連到每個使用者共用的背景 app-server daemon，hook 在 daemon 裡執行，`$TMUX_PANE` 會不存在或屬於別的 pane。帶 `--no-daemon`、任何非 UI 的 `-c`／`--config` 覆寫（Leader 的 Codex 啟動指令有 `--config 'model_reasoning_effort="medium"'`）、或 `codex exec` 時，Codex 在自己的行程執行，環境變數正確（由原始碼推論）。
+  - 建議對應（待實測）：
+
+    | 狀態 | Codex 事件 | 信心 |
+    | --- | --- | --- |
+    | working | `UserPromptSubmit`；`PreToolUse`／`PostToolUse` 也寫 working（核准後可清掉 blocked） | 高 |
+    | blocked | `PermissionRequest`（開啟自動審核時不一定真的出現提示，且沒有「已回應」事件） | 中高 |
+    | idle | `Stop`、`Interrupt`；`SessionStart` | Stop 高、Interrupt 中 |
+    | dead | 行程消失（沿用現有檢查）；`SessionEnd` 在 daemon 模式下 30 分鐘閒置才觸發，只當參考 | 行程檢查高 |
+  - 實作前要先確認：在測試 pane 用 `codex --no-daemon` 掛一個只記錄 stdin 的 hook，確認 `$TMUX_PANE` 有值、事件順序與 `session_id`；錯誤中斷的回合不會觸發 `Stop`，仍需要 `TM_STALE_AFTER` 與行程檢查兜底。安裝方式可比照 `tm install-claude-hook` 新增 `tm install-codex-hook`，但要處理 `/hooks` 的信任步驟。
