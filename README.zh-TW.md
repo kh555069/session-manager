@@ -329,8 +329,12 @@ tmux send-keys -t api-server "$CMD" Enter
 
 # 重新跑 guard 取得 Worker 所在 pane，再等它啟動完成
 eval "$(bash "$scripts/agent-instance-guard.sh" api-server)"
-start=$(tm wait "api-server:$PANE" --until done --timeout 60s) || exit 1
-[ "$(jq -r .state <<<"$start")" = blocked ] && { echo "啟動對話框待處理，請 attach"; exit 1; }
+start=$(tm wait "api-server:$PANE" --until done --timeout 60s)
+case $? in
+  0) [ "$(jq -r .state <<<"$start")" = blocked ] && { echo "Worker 在等使用者回應，請 attach"; exit 1; } ;;
+  1) echo "Worker 沒有回報 idle：可能停在啟動對話框（例如信任資料夾），請 attach"; exit 1 ;;
+  *) echo "Worker 沒有啟動或已結束"; exit 1 ;;
+esac
 
 # 送出任務：stdin 傳入，避免引號被 shell 解讀
 result=$(printf '%s' '實作 /healthz endpoint 並補上測試' \
@@ -356,7 +360,9 @@ esac
 tm wait --all --until done --after-change --match any
 ```
 
-- 啟動後用 `--until done` 而不是 `idle`：信任資料夾、升級提示等對話框會讓 Worker 停在 `blocked`，只等 `idle` 會一路等到逾時。
+- 在任何 hook 執行前出現的對話框（例如信任資料夾），狀態會維持 `unknown`，啟動時的等待會以逾時（exit 1）結束，而不是 `blocked`。啟動逾時應視為「需要人看一下」。
+- 仍然用 `--until done` 而不是 `idle`：hook 開始執行後，權限確認與要求輸入會以 `blocked` 呈現。
+- Codex 不回報 hook 狀態，agent 一律是 `unknown`，永遠不會達成 `done`；Codex Worker 仍以 `agent-state.sh` 判讀。
 - `agent-prompt.sh` 回 `12` 時文字可能還留在輸入框，重送會變成兩份任務，必須先交給使用者判斷。
 - `tm wait` 是 `agent-state.sh wait` 的候選替代；在 Leader 規則改版前，Worker 狀態判讀仍以 `agent-state.sh` 為準。
 

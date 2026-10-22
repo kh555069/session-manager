@@ -328,8 +328,12 @@ tmux send-keys -t api-server "$CMD" Enter
 
 # Re-run the guard to get the Worker's pane, then wait for it to start
 eval "$(bash "$scripts/agent-instance-guard.sh" api-server)"
-start=$(tm wait "api-server:$PANE" --until done --timeout 60s) || exit 1
-[ "$(jq -r .state <<<"$start")" = blocked ] && { echo "Startup dialog needs attention, please attach"; exit 1; }
+start=$(tm wait "api-server:$PANE" --until done --timeout 60s)
+case $? in
+  0) [ "$(jq -r .state <<<"$start")" = blocked ] && { echo "Worker is waiting for the user, please attach"; exit 1; } ;;
+  1) echo "Worker never reported idle: it may be stuck at a startup dialog (e.g. trust folder), please attach"; exit 1 ;;
+  *) echo "Worker did not start or has exited"; exit 1 ;;
+esac
 
 # Send the task on stdin so the shell never interprets its quotes
 result=$(printf '%s' 'Implement the /healthz endpoint and add tests' \
@@ -355,7 +359,9 @@ esac
 tm wait --all --until done --after-change --match any
 ```
 
-- Wait for `done` rather than `idle` after starting: trust-folder, upgrade and similar dialogs leave the Worker `blocked`, and waiting for `idle` alone would run into the timeout.
+- A dialog shown before any hook runs (such as the trust-folder prompt) leaves the state `unknown`, so the startup wait ends with a timeout (exit 1), not `blocked`. Treat a startup timeout as "a person needs to look".
+- Still wait for `done` rather than `idle`: once hooks run, permission and input prompts show up as `blocked`.
+- Codex reports no hook states, so its agents stay `unknown` and never reach `done`; keep using `agent-state.sh` for Codex Workers.
 - When `agent-prompt.sh` returns `12` the text may still be in the input box; resending would create two tasks, so a person has to decide first.
 - `tm wait` is a candidate replacement for `agent-state.sh wait`; until the Leader rules change, Worker state is still read with `agent-state.sh`.
 
