@@ -209,26 +209,15 @@ _build_list_cache() {
   _CACHE_LOADED=1
 }
 
-# Read agent state files for the panes given on stdin.
-# Input lines:  SESSION \t PANE_ID \t SESSION_CREATED \t WIN.PANE
-# Mode session: SESSION \t AGG_STATE  (blocked > working? > working > idle > unknown)
-# Mode pane:    WIN.PANE \t PANE_ID \t STATE \t SINCE_EPOCH \t REASON \t MESSAGE
-#               (only panes with a valid state file; empty REASON/MESSAGE → "-")
-# A state file is ignored when unreadable, when its state is unknown, or when
-# it predates its session (pane ids restart after a tmux server restart).
-_agent_states() {
-  local mode="$1"
-  command -v python3 &>/dev/null || return 0
-  python3 -I -S -c '
+# Python helpers shared by every reader of agent state files, so the fzf list
+# and `tm ls --json` apply the same validity rules. Must not contain single quotes.
+readonly _PY_STATE_LIB='
 import calendar, json, os, re, sys, time
 
-mode, state_dir, stale_after = sys.argv[1], sys.argv[2], int(sys.argv[3])
 # Terminal escape sequences (OSC, CSI) and other control characters in file
 # fields must never reach the terminal
-escapes = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]|\x1b.?")
-controls = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-now = time.time()
-rank = {"unknown": 0, "idle": 1, "working": 2, "working?": 3, "blocked": 4}
+_escapes = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]|\x1b.?")
+_controls = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 def epoch(value):
     try:
@@ -237,8 +226,49 @@ def epoch(value):
         return None
 
 def clean(value):
-    text = controls.sub(" ", escapes.sub("", str(value))) if value else ""
+    text = _controls.sub(" ", _escapes.sub("", str(value))) if value else ""
     return " ".join(text.split()) or "-"
+
+def load_state(state_dir, pane, created, now, stale_after):
+    """Validated state of one pane, or None when its state file is unusable.
+
+    Ignored: unreadable or non-object files, unknown states, missing ts, and
+    files older than the session (pane ids restart with the tmux server).
+    dead is reported as unknown; working older than stale_after is stale.
+    """
+    try:
+        with open(os.path.join(state_dir, pane.lstrip("%") + ".json")) as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    state = record.get("state")
+    ts = epoch(record.get("ts"))
+    if state not in ("working", "blocked", "idle", "dead") or ts is None:
+        return None
+    if str(created).isdigit() and ts < int(created):
+        return None
+    if state == "dead":
+        state = "unknown"
+    stale = state == "working" and now - ts > stale_after
+    return {"state": state, "stale": stale, "ts": ts,
+            "since": epoch(record.get("since")) or ts, "record": record}
+'
+
+# Read agent state files for the panes given on stdin.
+# Input lines:  SESSION \t PANE_ID \t SESSION_CREATED \t WIN.PANE
+# Mode session: SESSION \t AGG_STATE  (blocked > working? > working > idle > unknown)
+# Mode pane:    WIN.PANE \t PANE_ID \t STATE \t SINCE_EPOCH \t REASON \t MESSAGE
+#               (only panes with a valid state file; empty REASON/MESSAGE → "-")
+# Validity rules live in load_state (_PY_STATE_LIB).
+_agent_states() {
+  local mode="$1"
+  command -v python3 &>/dev/null || return 0
+  python3 -I -S -c "${_PY_STATE_LIB}"'
+mode, state_dir, stale_after = sys.argv[1], sys.argv[2], int(sys.argv[3])
+now = time.time()
+rank = {"unknown": 0, "idle": 1, "working": 2, "working?": 3, "blocked": 4}
 
 order, agg = [], {}
 for line in sys.stdin:
@@ -249,27 +279,15 @@ for line in sys.stdin:
     if session not in agg:
         order.append(session)
         agg[session] = "unknown"
-    try:
-        with open(os.path.join(state_dir, pane.lstrip("%") + ".json")) as f:
-            record = json.load(f)
-    except (OSError, ValueError):
+    loaded = load_state(state_dir, pane, created, now, stale_after)
+    if loaded is None:
         continue
-    if not isinstance(record, dict):
-        continue
-    state = record.get("state")
-    ts, since = epoch(record.get("ts")), epoch(record.get("since"))
-    if state not in ("working", "blocked", "idle", "dead") or ts is None:
-        continue
-    if created.isdigit() and ts < int(created):
-        continue
-    if state == "dead":
-        state = "unknown"
-    elif state == "working" and now - ts > stale_after:
-        state = "working?"
+    state = "working?" if loaded["stale"] else loaded["state"]
     if rank[state] > rank[agg[session]]:
         agg[session] = state
     if mode == "pane" and state != "unknown":
-        print("\t".join([target, pane, state, str(since or ts),
+        record = loaded["record"]
+        print("\t".join([target, pane, state, str(loaded["since"]),
                          clean(record.get("reason")), clean(record.get("message"))]))
 
 if mode == "session":
@@ -1319,6 +1337,128 @@ _cmd_simple_list() {
     printf "%-20s %-16s %-4s %-4s %-6s %s\n" \
       "${name}${lock}" "$status" "$windows" "$panes" "$idle" "$short_path"
   done < <(sort -t';' -k5,5 -rn <<< "$sessions_raw")
+}
+
+# tm ls [--json ...]: plain text without arguments, JSON otherwise
+_cmd_ls() {
+  if [[ $# -eq 0 ]]; then
+    _cmd_simple_list
+    return
+  fi
+  _ls_json "" "" "" 0
+}
+
+# Print every session and its agent panes as one JSON object (schema v1).
+# Args: STATES_CSV AGENT SESSION NO_SUMMARY(0|1); empty strings mean no filter.
+# Exit: 0 ok (also when empty), 2 session not found, 4 no tmux server.
+_ls_json() {
+  if ! command -v python3 &>/dev/null; then
+    echo -e "${C_RED}✗ python3 is required for --json${C_RESET}" >&2
+    exit 1
+  fi
+  python3 -I -S -c "${_PY_STATE_LIB}"'
+import socket, subprocess
+
+states_csv, agent_filter, session_filter, no_summary, config_dir, stale_after = sys.argv[1:7]
+stale_after = int(stale_after)
+now = time.time()
+
+def iso(value):
+    if value is None:
+        return None
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(value)))
+
+def git_branch(path):
+    # Walk up to the nearest .git (a directory, or a worktree "gitdir:" file)
+    current = path
+    while current:
+        dot_git = os.path.join(current, ".git")
+        head = None
+        if os.path.isdir(dot_git):
+            head = os.path.join(dot_git, "HEAD")
+        elif os.path.isfile(dot_git):
+            try:
+                with open(dot_git) as f:
+                    line = f.readline().strip()
+            except OSError:
+                return None
+            if not line.startswith("gitdir:"):
+                return None
+            gitdir = line[len("gitdir:"):].strip()
+            head = os.path.join(os.path.join(current, gitdir) if not os.path.isabs(gitdir) else gitdir, "HEAD")
+        if head:
+            try:
+                with open(head) as f:
+                    ref = f.readline().strip()
+            except OSError:
+                return None
+            prefix = "ref: refs/heads/"
+            return ref[len(prefix):] if ref.startswith(prefix) else None
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+    return None
+
+def last_summary(name):
+    try:
+        with open(os.path.join(config_dir, "summaries", name + ".jsonl")) as f:
+            lines = [line for line in f if line.strip()]
+        record = json.loads(lines[-1]) if lines else None
+    except (OSError, ValueError):
+        return None
+    if isinstance(record, dict) and isinstance(record.get("summary"), str):
+        return record["summary"]
+    return None
+
+fields = ["session_name", "session_created", "session_path", "session_windows",
+          "session_attached", "session_activity", "window_index", "pane_index",
+          "pane_id", "pane_pid"]
+fmt = "\t".join("#{" + f + "}" for f in fields)
+listing = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt],
+                         capture_output=True, text=True)
+if listing.returncode != 0:
+    sys.stderr.write("✗ tmux server is not running\n")
+    sys.exit(4)
+
+try:
+    with open(os.path.join(config_dir, "protected.txt")) as f:
+        protected = set(line.rstrip("\n") for line in f)
+except OSError:
+    protected = set()
+
+sessions = {}
+for line in listing.stdout.splitlines():
+    parts = line.split("\t")
+    if len(parts) != len(fields):
+        continue
+    row = dict(zip(fields, parts))
+    name = row["session_name"]
+    if name not in sessions:
+        sessions[name] = {
+            "name": name,
+            "dir": row["session_path"] or None,
+            "git_branch": git_branch(row["session_path"]) if row["session_path"] else None,
+            "windows": int(row["session_windows"] or 0),
+            "panes": 0,
+            "clients": int(row["session_attached"] or 0),
+            "last_activity": iso(row["session_activity"]) if row["session_activity"].isdigit() else None,
+            "protected": name in protected,
+            "summary": None if no_summary == "1" else last_summary(name),
+            "state": "unknown",
+            "agents": [],
+        }
+    sessions[name]["panes"] += 1
+
+result = {
+    "v": 1,
+    "host": socket.gethostname().split(".")[0] or None,
+    "generated_at": iso(now),
+    "sessions": [sessions[name] for name in sorted(sessions)],
+}
+json.dump(result, sys.stdout, ensure_ascii=False)
+sys.stdout.write("\n")
+' "$1" "$2" "$3" "$4" "$CONFIG_DIR" "$STALE_AFTER"
 }
 
 # ─── 10. AI Summary ──────────────────────────────────
@@ -2459,7 +2599,7 @@ case "${1:-}" in
   new|create)      _check_cmd tmux; _cmd_quick_new "${@:2}" ;;
   attach)          _check_cmd tmux; _cmd_attach "${@:2}" ;;
   kill|rm|remove)  _check_cmd tmux; _cmd_quick_kill "${2:-}" ;;
-  ls|list)         _check_cmd tmux; _cmd_simple_list ;;
+  ls|list)         _check_cmd tmux; _cmd_ls "${@:2}" ;;
   rename)          _check_cmd tmux; _cmd_rename "${2:-}" ;;
   last)            _check_cmd tmux; _cmd_last ;;
   templates|tpl)   _cmd_templates ;;
