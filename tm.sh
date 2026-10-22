@@ -1509,17 +1509,32 @@ def snapshot(config_dir, state_dir, stale_after, now, summary=True, git=True):
         panes.append({"session": name, "window": row["window_index"], "pane": row["pane_id"],
                       "target": name + ":" + row["window_index"] + "." + row["pane_index"]})
 
+    def elapsed(value):
+        # ps etime: [[dd-]hh:]mm:ss
+        days, _, clock = value.rpartition("-")
+        try:
+            units = [int(part) for part in clock.split(":")]
+            seconds = 0
+            for unit in units:
+                seconds = seconds * 60 + unit
+            return seconds + int(days or 0) * 86400
+        except ValueError:
+            return None
+
     # One ps call for the whole process tree
-    children, args = {}, {}
-    ps = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "args="],
+    children, args, started = {}, {}, {}
+    ps = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid=", "-o", "etime=", "-o", "args="],
                         capture_output=True, text=True)
     for line in ps.stdout.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        parts = line.split(None, 3)
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
             continue
         pid, ppid = int(parts[0]), int(parts[1])
         children.setdefault(ppid, []).append(pid)
-        args[pid] = parts[2] if len(parts) == 3 else ""
+        args[pid] = parts[3] if len(parts) == 4 else ""
+        age = elapsed(parts[2])
+        if age is not None:
+            started[pid] = now - age
 
     def detect_agent(root):
         # BFS from the pane shell; an agent is a process whose first or second
@@ -1551,8 +1566,11 @@ def snapshot(config_dir, state_dir, stale_after, now, summary=True, git=True):
         if not (isinstance(recorded_agent, str) and recorded_agent):
             recorded_agent = None
         # Without a live agent process the hook state is unconfirmed (e.g. killed
-        # without SessionEnd), so it is never reported as idle/blocked/working
-        confirmed = loaded is not None and found is not None
+        # without SessionEnd), so it is never reported as idle/blocked/working.
+        # A record written before that process started belongs to an earlier
+        # agent in the same pane (1s slack: ts and etime are whole seconds).
+        confirmed = (loaded is not None and found is not None
+                     and loaded["ts"] >= started.get(pid, 0) - 1)
         session["agents"].append({
             "pane": row["pane_id"],
             "target": row["session_name"] + ":" + row["window_index"] + "." + row["pane_index"],
@@ -1775,11 +1793,13 @@ while True:
         if agent["pid"] is not None:
             seen[agent["pane"]] = agent
     if baseline is None:
-        # --after-change: only a since different from the one at call time counts
-        baseline = {p["pane"]: agents[p["pane"]]["since"] if p["pane"] in agents else None
-                    for p in members}
+        # --after-change: only a (state, since) different from the one at call
+        # time counts; since alone misses a turn started and ended in one second
+        baseline = {p["pane"]: (agents[p["pane"]]["state"], agents[p["pane"]]["since"])
+                    if p["pane"] in agents else None for p in members}
     hits = [a for a in present if a["state"] in wanted
-            and (after_change != "1" or (a["since"] is not None and a["since"] != baseline.get(a["pane"])))]
+            and (after_change != "1" or (a["since"] is not None
+                                         and (a["state"], a["since"]) != baseline.get(a["pane"])))]
     if match == "any" and hits:
         emit(hits)
         sys.exit(0)

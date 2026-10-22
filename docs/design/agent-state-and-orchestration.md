@@ -283,7 +283,8 @@ tm wait --all --until done --after-change --match any
 - **尚未就緒**：pane 存在但還沒有 agent 時繼續等，不算 dead。
 - **Dead**：等待中曾看到有 `pid` 的 agent，之後 pane 消失、agent 不見或 `pid` 變成 `null`（涵蓋 `kill -9`）。輸出最後一次看到的 agent，`state` 改為 `dead`。
 - **條件**：`unknown`（含 heuristic）不符合 `idle`、`blocked`、`done`；`stale` 的 working 仍是 working。`--match all` 只計算有 agent 的 pane。
-- **`--after-change`**：記下開始時每個 pane 的 `since`，只採信 `since` 存在且不同的狀態；`since` 只到秒，用「不同」而非「較新」比對。
+- **`--after-change`**：記下開始時每個 pane 的（`state`, `since`），只採信 `since` 存在且這組值不同的狀態。只比 `since` 會漏掉同一秒內開始又結束的一輪；`since` 只到秒，所以用「不同」而非「較新」比對。
+- **舊紀錄**：狀態檔的 `ts` 早於 agent 行程啟動時間（`ps etime`，容許 1 秒誤差）時不採信。同一 pane 先前的 agent 被 `kill -9` 後留下的 `idle`，不會讓新啟動的 agent 被誤判為 done。這條規則在共用 snapshot 裡，`tm ls --json` 同樣適用。
 - **逾時**：exit 1，stdout 印出所有 agent 目前的狀態。
 - **inotify**：`inotifywait -qq -t <ceil(interval)>` 監看狀態目錄，逾時保證每輪仍檢查 pane；`interval < 1` 或目錄不存在時直接 sleep。
 

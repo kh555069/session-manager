@@ -258,7 +258,7 @@ After `tm install-claude-hook`, Claude Code hooks report each agent's state, and
 | `4` | No tmux server is running |
 
 - stdout carries only JSON; warnings and errors go to stderr. Missing values are `null`, keys are never omitted.
-- `source` is `hook` when the state comes from a Claude hook, `heuristic` when an agent process was found but no hook state exists (Codex, or hooks not installed). Heuristic agents are `unknown`. A hook state is only trusted while the agent process is still running: if the agent was killed without its exit hook, the pane stays listed with `pid: null` and state `unknown`, never `idle`.
+- `source` is `hook` when the state comes from a Claude hook, `heuristic` when an agent process was found but no hook state exists (Codex, or hooks not installed). Heuristic agents are `unknown`. A hook state is only trusted while the agent process is still running, and only if it was written after that process started (a record left by an earlier agent in the same pane is ignored): if the agent was killed without its exit hook, the pane stays listed with `pid: null` and state `unknown`, never `idle`.
 - `stale: true` marks a `working` agent with no hook update for `TM_STALE_AFTER` seconds.
 - `target` can be passed straight to `tmux send-keys -t`. `v` only increases on breaking changes; ignore unknown keys.
 
@@ -298,7 +298,7 @@ tm wait <target>|--all --until idle|blocked|done|dead [--timeout 30m] [--interva
 
 On return, stdout has one JSON object per agent, in the same format as `tm ls --json` `agents[]`: the agents that met the condition, the ones that died (`state: "dead"`), or, on timeout, the current state of every agent.
 
-- **Send a prompt, then wait with `--after-change`.** Right after a prompt the hook may not have written `working` yet, so the previous turn's `idle` would end the wait at once. `--after-change` ignores the state the agent was already in when `tm wait` started.
+- **Send a prompt, then wait with `--after-change`.** Right after a prompt the hook may not have written `working` yet, so the previous turn's `idle` would end the wait at once. `--after-change` only accepts a state whose (state, `since`) pair differs from the one the agent had when `tm wait` started, so even a turn that starts and ends within the same second counts.
 - **Startup is not death.** A pane whose agent has not started yet keeps the wait going. An agent counts as dead once it was seen running and then its pane closed, or its process disappeared — this also catches `kill -9`, which never runs the exit hook.
 - **`unknown` is never done.** Agents without a hook state (Codex, hooks not installed) and agents whose process is gone do not satisfy `idle`, `blocked` or `done`.
 - **`--match all` only counts panes with an agent**, so a plain shell pane in the session does not hold it up.

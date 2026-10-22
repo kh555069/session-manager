@@ -259,7 +259,7 @@ cp completions/tm.zsh ~/.zsh/completions/_tm
 | `4` | tmux server 未啟動 |
 
 - stdout 只放 JSON，警告與錯誤寫 stderr。沒有值的欄位輸出 `null`，不省略 key。
-- `source` 為 `hook` 表示狀態來自 Claude hook；`heuristic` 表示找到 agent 行程但沒有 hook 狀態（Codex 或沒裝 hook），此時狀態為 `unknown`。Hook 狀態只在 agent 行程還在時才採信：agent 被強制結束、沒有執行結束 hook 時，pane 仍會列出，但 `pid` 為 `null`、狀態為 `unknown`，不會顯示 `idle`。
+- `source` 為 `hook` 表示狀態來自 Claude hook；`heuristic` 表示找到 agent 行程但沒有 hook 狀態（Codex 或沒裝 hook），此時狀態為 `unknown`。Hook 狀態只在 agent 行程還在、且寫入時間晚於該行程啟動時才採信（同一 pane 先前 agent 留下的紀錄會被忽略）：agent 被強制結束、沒有執行結束 hook 時，pane 仍會列出，但 `pid` 為 `null`、狀態為 `unknown`，不會顯示 `idle`。
 - `stale: true` 表示 `working` 的 agent 已超過 `TM_STALE_AFTER` 秒沒有 hook 更新。
 - `target` 可直接交給 `tmux send-keys -t`。`v` 只在破壞相容時遞增，呼叫端應忽略不認得的 key。
 
@@ -299,7 +299,7 @@ tm wait <target>|--all --until idle|blocked|done|dead [--timeout 30m] [--interva
 
 返回時 stdout 每行一個 JSON 物件，格式與 `tm ls --json` 的 `agents[]` 相同。依返回原因，內容是達成條件的 agent、已結束的 agent（`state: "dead"`），或逾時時每個 agent 目前的狀態。
 
-- **送出 prompt 後，搭配 `--after-change` 等待。** 剛送出 prompt 時 hook 可能還沒寫入 `working`，上一輪的 `idle` 會讓 wait 立刻結束。`--after-change` 會忽略呼叫當下 agent 已處於的狀態。
+- **送出 prompt 後，搭配 `--after-change` 等待。** 剛送出 prompt 時 hook 可能還沒寫入 `working`，上一輪的 `idle` 會讓 wait 立刻結束。`--after-change` 只接受「狀態與 `since`」組合和呼叫當下不同的狀態，因此同一秒內開始又結束的一輪也會被認出。
 - **還沒啟動不等於已結束。** agent 還沒啟動的 pane 會繼續等待。agent 必須先被看到在執行，之後 pane 關閉或行程消失，才算結束；這也涵蓋不會觸發結束 hook 的 `kill -9`。
 - **`unknown` 永遠不算完成。** 沒有 hook 狀態的 agent（Codex 或沒裝 hook），以及行程已不存在的 agent，都不符合 `idle`、`blocked`、`done`。
 - **`--match all` 只計算有 agent 的 pane**，session 裡的一般 shell pane 不會讓它一直等下去。

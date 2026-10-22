@@ -173,6 +173,39 @@ test_until_dead_exit_0() {
   assert_eq dead "$(json 'd["state"]' <<< "$out")" state
 }
 
+# ─── Final review fixes ───────────────────────────────
+
+# rewrite_state <target> <state>: change the state but keep ts/since, as when
+# a turn starts and ends within the same second
+rewrite_state() {
+  python3 - "$STATE_DIR/$(pane_id "$1" | tr -d %).json" "$2" <<'PY'
+import json, sys
+p, state = sys.argv[1], sys.argv[2]
+d = json.load(open(p)); d["state"] = state; json.dump(d, open(p, "w"))
+PY
+}
+
+test_after_change_accepts_same_second_turn() {
+  agent_pane new a
+  set_state a working
+  later 0.5 rewrite_state a idle
+  local code; "$TM" wait a --until idle --after-change --interval 0.2 --timeout 3s >/dev/null; code=$?
+  wait
+  assert_eq 0 "$code" exit
+}
+
+# A state file written before the agent process started belongs to an earlier
+# agent (killed without SessionEnd) and must not confirm the new one
+test_state_older_than_agent_process_is_unconfirmed() {
+  fake_agent claude
+  tmux new-session -d -s a -c "$TEST_TMP" "bash -c 'sleep 2; \"$TEST_TMP/bin/claude\"; true'"
+  set_state a idle
+  sleep 2.5
+  local code; "$TM" wait a --until idle --interval 0.2 --timeout 1s >/dev/null; code=$?
+  assert_eq 1 "$code" wait-not-done
+  assert_eq unknown "$("$TM" ls --json | json 'd["sessions"][0]["agents"][0]["state"]')" ls-state
+}
+
 # ─── Task 3: inotify wake-up and SIGINT ───────────────
 
 # fake_inotifywait [seconds]: stands in for inotify-tools; reports an event
