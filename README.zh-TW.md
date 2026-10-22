@@ -372,7 +372,7 @@ tm wait --all --until done --after-change --match any
 
 ### `tm dash`
 
-與主選單相同的列表與快捷鍵，但會自動更新：狀態檔一變更就重新載入（需要 `inotifywait`），否則每 2 秒一次。即使有 session 變成 blocked 被排到最上面，游標也會停在原本的 session。Preview 會顯示每個 blocked pane 最後 15 行畫面，不用 attach 就能看到它在問什麼。
+與主選單相同的列表與快捷鍵，但會自動更新：狀態檔一變更就檢查（需要 `inotifywait`），否則每 2 秒檢查一次，列表內容真的有變才重新載入。即使有 session 變成 blocked 被排到最上面，或正在輸入搜尋字串，游標也會停在原本的 session。有 session 被 Tab 選取時不會重新載入，選取不會消失。Preview 會顯示每個 blocked pane 最後 15 行畫面，不用 attach 就能看到它在問什麼。
 
 ```
 # ~/.tmux.conf

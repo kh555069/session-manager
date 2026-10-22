@@ -1017,16 +1017,24 @@ _attach_session() {
 
 # Session list in fzf with the main menu keys; prints the selected lines.
 # Shared by the main menu and tm dash. Args: BORDER_LABEL [extra fzf args...]
+# Columns fzf shows and matches against (narrow terminals drop DIRECTORY)
+_fzf_with_nth() {
+  if _is_narrow; then
+    echo "1,2,3,4,5"
+  else
+    echo "1,2,3,4,5,6"
+  fi
+}
+
 _fzf_menu() {
   local label="$1"; shift
   # Adapt fzf header and column display for narrow terminals
   local fzf_header fzf_with_nth
+  fzf_with_nth=$(_fzf_with_nth)
   if _is_narrow; then
     fzf_header="↵Go Tab^Sel ^NNew ^KKill ^ERen ^DDtch ^PLock ^RRef Esc"
-    fzf_with_nth="1,2,3,4,5"
   else
     fzf_header="Keys: ↵Enter │ Tab Multi-sel │ ^N New │ ^K Kill │ ^E Rename │ ^D Detach │ ^P Protect │ ^R Refresh │ ^Q Quit"
-    fzf_with_nth="1,2,3,4,5,6"
   fi
 
   "$SELF" _list \
@@ -1121,12 +1129,16 @@ _cmd_dash() {
   mkdir -p "$run_dir" && chmod 700 "$run_dir"
   _DASH_SOCK="${run_dir}/dash-$$.sock"
   _DASH_OUT="${run_dir}/dash-$$.out"
+  _DASH_LIST="${run_dir}/dash-$$.list"
   _DASH_WATCHER=""
   _DASH_FZF=""
   trap '_dash_cleanup' EXIT
   # bash defers traps while a foreground command runs, so fzf runs in the
-  # background and `wait` (which a trapped signal interrupts) waits for it
-  trap '_dash_abort; exit 130' INT
+  # background and `wait` (which a trapped signal interrupts) waits for it.
+  # SIGINT only reaches us when Ctrl-C is pressed inside an execute() prompt
+  # (fzf reads Ctrl-C itself otherwise): like the main menu, it only cancels
+  # that prompt, so it is ignored here and fzf keeps running.
+  trap ':' INT
   trap '_dash_abort; exit 143' TERM
   trap '_dash_abort; exit 129' HUP
 
@@ -1137,7 +1149,7 @@ _cmd_dash() {
     ( umask 077; : > "$_DASH_OUT" )
     _fzf_menu " tm dash " --listen="$_DASH_SOCK" > "$_DASH_OUT" &
     _DASH_FZF=$!
-    wait "$_DASH_FZF" || true  # fzf exits non-zero on Esc or no match
+    _dash_wait_fzf
     _DASH_FZF=""
     _dash_stop_watcher
     selected=$(<"$_DASH_OUT")
@@ -1154,10 +1166,18 @@ _cmd_dash() {
   done
 }
 
+# Wait until fzf has really exited: a trapped signal interrupts `wait` early.
+# fzf exits non-zero on Esc or no match, which must not trip set -e.
+_dash_wait_fzf() {
+  while kill -0 "$_DASH_FZF" 2>/dev/null; do
+    wait "$_DASH_FZF" 2>/dev/null || true
+  done
+}
+
 _dash_stop_watcher() {
   if [[ -n "$_DASH_WATCHER" ]]; then
-    kill "$_DASH_WATCHER" 2>/dev/null
-    wait "$_DASH_WATCHER" 2>/dev/null
+    kill "$_DASH_WATCHER" 2>/dev/null || true
+    wait "$_DASH_WATCHER" 2>/dev/null || true
     _DASH_WATCHER=""
   fi
 }
@@ -1165,8 +1185,8 @@ _dash_stop_watcher() {
 # Ask the running fzf to quit (dash got a signal) and wait for it
 _dash_abort() {
   if [[ -n "$_DASH_FZF" ]]; then
-    curl -s --max-time 2 --unix-socket "$_DASH_SOCK" -XPOST http://localhost -d "abort" >/dev/null 2>&1
-    wait "$_DASH_FZF" 2>/dev/null
+    curl -s --max-time 2 --unix-socket "$_DASH_SOCK" -XPOST http://localhost -d "abort" >/dev/null 2>&1 || true
+    _dash_wait_fzf
     _DASH_FZF=""
   fi
 }
@@ -1176,6 +1196,8 @@ _dash_cleanup() {
   _dash_stop_watcher
   [[ -S "$_DASH_SOCK" ]] && rm -f "$_DASH_SOCK"
   [[ -f "$_DASH_OUT" ]] && rm -f "$_DASH_OUT"
+  [[ -f "$_DASH_LIST" ]] && rm -f "$_DASH_LIST"
+  return 0
 }
 
 # Background loop of tm dash: after each state file change (inotifywait) or
@@ -1198,36 +1220,55 @@ _dash_watch() {
       sleep 2 &
     fi
     child=$!
-    wait "$child"
+    wait "$child" || true  # inotifywait exits 2 on its timeout
     child=""
     if ! kill -0 "$dash_pid" 2>/dev/null; then
       curl -s --max-time 2 --unix-socket "$sock" -XPOST http://localhost -d "abort" >/dev/null 2>&1
       exit 0
     fi
     curl -s --max-time 2 --unix-socket "$sock" -XPOST http://localhost \
-      -d "transform:$SELF _dash-reload {2}" >/dev/null 2>&1 || exit 0
+      -d "transform:$SELF _dash-reload {2} $dash_pid" >/dev/null 2>&1 || exit 0
   done
 }
 
-# fzf action that reloads the list and keeps the cursor on session NAME
+# fzf action for tm dash: reload the list and keep the cursor on session NAME.
+# Prints nothing (no reload) while sessions are Tab-selected, or when the list
+# is unchanged since the last reload of dash DASH_PID. The position is counted
+# among the rows fzf will show: with a query, those are `fzf --filter` results.
+# Args: NAME [DASH_PID]  (env from fzf: FZF_QUERY, FZF_SELECT_COUNT)
 _cmd_dash_reload() {
   _parse_name "${1:-}"
-  local name="$_PARSED" list n=0 pos=0 line _skip field
+  local name="$_PARSED" dash_pid="${2:-}" list list_file rows n=0 pos=0 line _skip field
+  [[ "${FZF_SELECT_COUNT:-0}" =~ ^[0-9]+$ && "${FZF_SELECT_COUNT:-0}" -gt 0 ]] && return 0
+
   list=$("$SELF" _list)
+  local reload="reload-sync($SELF _list)"
+  if [[ -n "$dash_pid" ]]; then
+    list_file="${CONFIG_DIR}/run/dash-${dash_pid}.list"
+    [[ -f "$list_file" && "$(<"$list_file")" == "$list" ]] && return 0
+    ( umask 077; printf '%s\n' "$list" > "$list_file" )
+    reload="reload-sync(cat '$list_file')"
+  fi
+
+  rows=$(sed 1d <<< "$list")  # without the header line
+  if [[ -n "${FZF_QUERY:-}" ]]; then
+    rows=$("$FZF" --filter="$FZF_QUERY" --exact --delimiter=$'\t' \
+      --with-nth="$(_fzf_with_nth)" <<< "$rows" || true)
+  fi
   while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
     n=$((n + 1))
-    [[ $n -eq 1 ]] && continue  # header line
     IFS=$'\t' read -r _skip field _skip <<< "$line"
     _parse_name "$field"
     if [[ -n "$name" && "$_PARSED" == "$name" ]]; then
-      pos=$((n - 1))
+      pos=$n
       break
     fi
-  done <<< "$list"
+  done <<< "$rows"
   if [[ $pos -gt 0 ]]; then
-    echo "reload-sync($SELF _list)+pos($pos)"
+    echo "${reload}+pos($pos)"
   else
-    echo "reload-sync($SELF _list)"
+    echo "$reload"
   fi
 }
 

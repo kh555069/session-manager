@@ -371,7 +371,7 @@ Three more ways to see agent states, all reading the same state files: `tm dash`
 
 ### `tm dash`
 
-The main menu list with the same keys, but it refreshes itself: whenever a state file changes (with `inotifywait`) or every 2 seconds otherwise. The cursor stays on the session it was on, even when a blocked session moves to the top. The preview shows the last 15 screen lines of every blocked pane, so you can see what it is asking without attaching.
+The main menu list with the same keys, but it refreshes itself: it checks whenever a state file changes (with `inotifywait`) or every 2 seconds otherwise, and reloads only when the list actually changed. The cursor stays on the session it was on, even when a blocked session moves to the top or a search query is typed. While sessions are Tab-selected it does not reload, so the selection is kept. The preview shows the last 15 screen lines of every blocked pane, so you can see what it is asking without attaching.
 
 ```
 # ~/.tmux.conf
