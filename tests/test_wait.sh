@@ -198,9 +198,11 @@ test_after_change_accepts_same_second_turn() {
 # agent (killed without SessionEnd) and must not confirm the new one
 test_state_older_than_agent_process_is_unconfirmed() {
   fake_agent claude
-  tmux new-session -d -s a -c "$TEST_TMP" "bash -c 'sleep 2; \"$TEST_TMP/bin/claude\"; true'"
+  # The agent starts 3s after the record: ts and ps etime are whole seconds and
+  # the reader allows 1s of slack, so a shorter gap can still look current
+  tmux new-session -d -s a -c "$TEST_TMP" "bash -c 'sleep 3; \"$TEST_TMP/bin/claude\"; true'"
   set_state a idle
-  sleep 2.5
+  sleep 3.5
   local code; "$TM" wait a --until idle --interval 0.2 --timeout 1s >/dev/null; code=$?
   assert_eq 1 "$code" wait-not-done
   assert_eq unknown "$("$TM" ls --json | json 'd["sessions"][0]["agents"][0]["state"]')" ls-state
