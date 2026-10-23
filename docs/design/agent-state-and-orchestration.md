@@ -332,7 +332,7 @@ $ tm state-count
 ```
 
 - `--format tmux`（預設）帶 tmux 色碼，blocked 以紅色顯示；`--format plain` 輸出純文字給其他工具使用。
-- 只讀狀態檔加一次 `tmux list-panes`，排除已不存在的 pane，目標小於 30 ms。tmux 以非同步方式執行 `#()`，不會拖慢畫面。
+- 只讀狀態檔加一次 `tmux list-panes`，排除已不存在的 pane，目標小於 50 ms（原訂 30 ms，理由見下方「PR 4 決定」）。tmux 以非同步方式執行 `#()`，不會拖慢畫面。
 
 ```
 set -g status-interval 5
@@ -360,7 +360,7 @@ Notification 的 `message` 可能含指令內容或路徑，送到外部服務�
 
 ### PR 4 決定
 
-- **state-count**：用 fzf 列表的 `_agent_states`（狀態檔加一次 `tmux list-panes`，不跑 ps）；逾時的 working 算進 ⏳，`unknown`、`dead` 不計；任何錯誤都輸出空字串、exit 0，只有 `--format` 不合法時 exit 3。30 個 session 實測 39 ms，未達 30 ms：python3 啟動 18 ms、`import json` 6 ms、bash 解析 tm.sh 10 ms、tmux 7 ms，用 python 無法再降；要達標只能用純 bash 重寫狀態檔判斷，會與共用的判斷規則分岔，所以先維持。
+- **state-count**：用 fzf 列表的 `_agent_states`（狀態檔加一次 `tmux list-panes`，不跑 ps）；逾時的 working 算進 ⏳，`unknown`、`dead` 不計；任何錯誤都輸出空字串、exit 0，只有 `--format` 不合法時 exit 3。30 個 session 實測 39 ms，未達 30 ms：python3 啟動 18 ms、`import json` 6 ms、bash 解析 tm.sh 10 ms、tmux 7 ms，用 python 無法再降。2026-10-23 重測（42 個 pane、16 個 agent）：整體 36.7 ms，python3 啟動加 `import json` 23.4 ms、bash 解析 tm.sh 約 10 ms、tmux 6.8 ms。決定把目標放寬到 50 ms：tmux 以非同步方式執行 `#()`，預設每 15 秒一次，多出的幾 ms 感覺不到。不採用的做法：在 tm.sh 開頭提早分派 `state-count`（約 27 ms，但要把 `_PY_STATE_LIB`、`_agent_states` 等搬到檔頭，留下隱藏的順序限制，餘裕也很小）；用純 bash 重寫狀態檔判斷（約 15 ms，但判斷規則會出現第二份，與 `ls --json`、dash 分岔）。
 - **dash 的控制通道**：fzf `--listen=<Unix socket>`，放在 `~/.tmux-manager/run/`（0700），因為 `reload(...)` 會執行指令，TCP port 任何本機使用者都能連。監看迴圈送出 `transform:tm _dash-reload {2} <dash pid>`，回傳 `reload-sync(cat run/dash-<pid>.list)+pos(n)` 讓游標留在原本的 session：fzf 載入的正是算位置時用的那份列表；有搜尋字串時，位置改用 `fzf --filter` 套同樣的條件計算；列表沒變或有 Tab 選取時不回傳任何 action（不重新載入）；`transform(...)` 的括號寫法會在內層第一個 `)` 截斷，所以用冒號寫法。
 - **dash 的結束**：bash 在前景指令執行時會延後處理 trap，所以 fzf 在背景執行、bash 以 `wait` 等待；TERM、HUP 時透過 socket 送 `abort`；SIGINT 只會在 `execute()` 提示中按 Ctrl-C 時出現，與主選單一樣只取消提示，dash 忽略它並繼續等 fzf。所有 `wait` 都容許非 0（`inotifywait` 逾時回 2），否則 `set -e` 會讓 dash 結束。監看迴圈在 dash 行程消失時也會 abort fzf 並結束。fzf 的輸出寫到 `run/dash-<pid>.out`、列表快取寫到 `run/dash-<pid>.list`，結束時與殘留的 socket 一起移除。
 - **popup**：tmux 無法可靠判斷程式是否在 popup 內，改用 `tm dash --popup`：Enter 後 switch-client 並結束。
