@@ -395,13 +395,18 @@ Notification 的 `message` 可能含指令內容或路徑，送到外部服務�
   - PR 1 決定：寫入 `tm.sh` 的絕對路徑，與既有 `_record-claude-session` 相同。
 - [x] `PreToolUse` 每次寫檔的實際成本，在密集工具呼叫下是否可接受？先量測再決定是否加短路。
   - 量測（macOS，20–40 次平均）：預設 `python3` 為 54.3 ms；改用 `python3 -I -S` 並移除 `tempfile` 後為 39.4 ms，低於 50 ms，不需要短路。
-- [ ] Subagent（Task tool）的事件是否會覆寫主 agent 的狀態？可能需要忽略 `SubagentStop`，或依 `session_id` 區分。
+- [x] Subagent（Task tool）的事件是否會覆寫主 agent 的狀態？可能需要忽略 `SubagentStop`，或依 `session_id` 區分。
   - 文件調查（2026-10-22，Claude Code 2.1.308，hooks 與 sub-agents 官方文件；尚未用真機 log 確認）：
     - **前景 subagent 不會造成誤判**：主對話會等 subagent 結束；subagent 的工具呼叫同樣觸發 `PreToolUse`／`PostToolUse`（寫入 `working`），輸入帶 `agent_id`、`agent_type`。`Stop` 的說明是「主 agent 回應結束」，subagent 結束送的是 `SubagentStop`。
     - **背景 subagent 會造成誤判**：從主對話叫出的 subagent 預設在背景執行，主 agent 這一輪的 `Stop` 可能在 subagent 還在跑時就寫入 `idle`，結果在之後的回合才回來。`tm wait --until done` 會因此太早返回；subagent 只在呼叫工具時才會把狀態改回 `working`。
     - `Stop` 的輸入有 `background_tasks` 欄位（範圍是父 session），可用來判斷還有沒有背景工作。
     - 主 agent 與 subagent 的 `session_id` 是否相同，文件沒寫；subagent 的 transcript 放在父 session 目錄下，推測相同。
-  - 修正方向（待真機確認後實作）：`Stop` 的 `background_tasks` 非空時不寫 `idle`，改維持 `working`；或另裝 `SubagentStart`／`SubagentStop`，以 `agent_id` 計數，計數大於 0 時不寫 `idle`。兩者都要先用只記錄 stdin 的 hook 實測欄位內容。
+  - 真機實測（2026-10-23，Claude Code 2.1.308，只記錄 stdin 的 hook）：
+    - 即使 prompt 要求等待，subagent 也以背景執行；主 agent 的 `Stop` 在 subagent 還在跑時觸發，原本的對應會寫入 `idle`（實測中有一段 25 秒顯示 💤）。
+    - `Stop` 的 `background_tasks` 準確列出還在跑的 subagent（`type: subagent`、`status: running`），全部結束後的 `Stop` 是空陣列。subagent 結束時 Claude 會自動送一個 `UserPromptSubmit` 給主 agent，處理完再觸發一次 `Stop`。
+    - 主 agent 的事件沒有 `agent_id`，subagent 的事件有；`session_id` 相同；subagent 的 hook 拿得到相同的 `$TMUX_PANE`。
+    - `SubagentStart`／`SubagentStop` 計數不可靠：每次主 agent `Stop` 後 1～2 秒會出現沒有對應 `SubagentStart`、`agent_type` 為空的 `SubagentStop`（推測是 Claude Code 內部 agent）。
+  - 決定：`tm hook-state idle` 收到的 `background_tasks` 中有 `type: subagent` 且 `status: running` 的項目時，改寫 `working`（`since` 沿用），不寫 `idle`。只看 subagent，背景 shell（例如 dev server）可能永遠不結束。不安裝 `SubagentStop`。尚未實測背景 Bash 指令在 `background_tasks` 中的 `type`，依此規則不會被計入。
   - 同次調查的其他發現：
     - `notification_type` 文件列出 13 種，目前只處理 4 種。`elicitation_url_dialog`（MCP 要求開瀏覽器）與 `agent_needs_input`（背景 session 等待輸入）應評估是否算 `blocked`；其餘（`agent_completed`、`quota_auto_resume_*`、`plugin_notification`、`elicitation_complete`、`elicitation_response`）不是等待使用者的訊號。
     - 權限提示約等 6 秒才送 `permission_prompt`，在那之前會先顯示 `⏳`。

@@ -136,4 +136,47 @@ test_hook_ignores_unwritable_home() {
   assert_eq 0 "$code" exit
 }
 
+# Payloads below follow a real Claude Code 2.1.308 Stop event (hooklog test,
+# 2026-10-23): the main turn ends while a background subagent still runs.
+BG_RUNNING='{"hook_event_name":"Stop","session_id":"s1","background_tasks":[{"id":"aa468ebacc080e6be","type":"subagent","status":"running","description":"Run sleep 40 and report","agent_type":"general-purpose"}]}'
+
+test_stop_with_running_subagent_stays_working() {
+  hook working '{"hook_event_name":"UserPromptSubmit","session_id":"s1"}'
+  local since; since=$(field since)
+  sleep 1.1
+  hook idle "$BG_RUNNING"
+  assert_eq working "$(field state)" state
+  assert_eq "$since" "$(field since)" since-kept
+  assert_eq Stop "$(field event)" event
+}
+
+test_stop_without_background_is_idle() {
+  hook working '{"hook_event_name":"UserPromptSubmit"}'
+  hook idle '{"hook_event_name":"Stop","background_tasks":[]}'
+  assert_eq idle "$(field state)" state
+}
+
+test_stop_ignores_other_background_tasks() {
+  # A long-running background shell (e.g. a dev server) must not keep the
+  # agent "working" forever; only subagents count
+  hook working '{"hook_event_name":"UserPromptSubmit"}'
+  hook idle '{"hook_event_name":"Stop","background_tasks":[{"id":"b1","type":"shell","status":"running"}]}'
+  assert_eq idle "$(field state)" state
+}
+
+test_stop_ignores_finished_subagent() {
+  hook working '{"hook_event_name":"UserPromptSubmit"}'
+  hook idle '{"hook_event_name":"Stop","background_tasks":[{"id":"a1","type":"subagent","status":"completed"}]}'
+  assert_eq idle "$(field state)" state
+}
+
+test_stop_with_malformed_background_tasks_is_idle() {
+  hook working '{"hook_event_name":"UserPromptSubmit"}'
+  hook idle '{"hook_event_name":"Stop","background_tasks":"oops"}'
+  assert_eq idle "$(field state)" string
+  hook working '{"hook_event_name":"UserPromptSubmit"}'
+  hook idle '{"hook_event_name":"Stop","background_tasks":[1, null, "x"]}'
+  assert_eq idle "$(field state)" bad-items
+}
+
 run_tests

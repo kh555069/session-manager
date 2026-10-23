@@ -218,6 +218,7 @@ cp completions/tm.zsh ~/.zsh/completions/_tm
 | `·` | unknown | 沒有 agent、agent 已結束，或沒裝 hook |
 
 - 一個 session 有多個 agent 時，顯示最需要注意的狀態（blocked > working > idle）。
+- Agent 這一輪結束後，如果它派出的背景 subagent 還在跑，狀態會維持 `⏳`，等 subagent 的結果處理完才變成 `💤`。
 - 有 blocked agent 的 session 會排到最上面；設定 `TM_SORT=recent` 可維持單純的最近使用排序。
 - Preview 面板列出每個 agent pane 的狀態、持續多久，blocked 時另外顯示通知訊息。
 - 狀態依 pane 存放在 `~/.tmux-manager/state/<pane>.json`（僅擁有者可讀）；`tm save` 會清掉已不存在的 pane 的檔案。

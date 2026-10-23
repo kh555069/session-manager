@@ -2297,6 +2297,16 @@ except ValueError:
 if not isinstance(payload, dict):
     payload = {}
 
+# The main turn can end while a background subagent still runs; its results
+# arrive in a later turn, so the agent is not idle yet. Only subagents count:
+# a background shell (e.g. a dev server) may never finish.
+if state == "idle":
+    tasks = payload.get("background_tasks")
+    if isinstance(tasks, list) and any(
+            isinstance(t, dict) and t.get("type") == "subagent" and t.get("status") == "running"
+            for t in tasks):
+        state = "working"
+
 reason = message = None
 if state == "blocked":
     message = payload.get("message")

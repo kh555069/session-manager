@@ -217,6 +217,7 @@ After `tm install-claude-hook`, Claude Code hooks report each agent's state, and
 | `·` | unknown | No agent, agent exited, or hooks not installed |
 
 - A session with several agents shows the one that needs attention most (blocked > working > idle).
+- An agent stays `⏳` after its turn ends while a background subagent it started is still running; it turns `💤` once the subagent's results are handled.
 - Sessions with a blocked agent float to the top. Set `TM_SORT=recent` to keep the plain most-recent order.
 - The preview panel lists each agent pane with its state, how long it has been in that state, and the notification message when blocked.
 - States are stored per pane in `~/.tmux-manager/state/<pane>.json` (owner-only). `tm save` removes files of panes that no longer exist.
