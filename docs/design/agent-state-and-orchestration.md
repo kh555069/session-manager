@@ -35,7 +35,7 @@ tm.sh 補上三項能力，讓 Leader Agent 可以用 CLI 管理 Worker，不必
 
 `PreToolUse` 在權限確認**之前**觸發，所以使用者核准後真正把 `blocked` 拉回 `working` 的是 `PostToolUse`；只靠 `PreToolUse` 的話，核准後整段工具執行期間都會停在 `blocked`。使用者拒絕或按 Esc 中斷時沒有 `PostToolUse`，`blocked` 會留到下一個 prompt。這兩個 hook 觸發頻繁，寫入必須夠輕（見下方效能限制）。
 
-`Notification` 只有權限確認（`permission_prompt`）與要求輸入（`elicitation_dialog`）寫 `blocked`。`idle_prompt` 是每次 `Stop` 約 60 秒後的閒置提醒，這時一輪已經結束、狀態已是 `idle`，不寫檔；否則每個做完的 session 都會在一分鐘後變成 `blocked` 並置頂。
+`Notification` 只有權限確認（`permission_prompt`）與要求輸入（`elicitation_dialog`、`elicitation_url_dialog`）寫 `blocked`。`idle_prompt` 是每次 `Stop` 約 60 秒後的閒置提醒，這時一輪已經結束、狀態已是 `idle`，不寫檔；否則每個做完的 session 都會在一分鐘後變成 `blocked` 並置頂。
 
 ### 狀態檔格式
 
@@ -408,7 +408,9 @@ Notification 的 `message` 可能含指令內容或路徑，送到外部服務�
     - `SubagentStart`／`SubagentStop` 計數不可靠：每次主 agent `Stop` 後 1～2 秒會出現沒有對應 `SubagentStart`、`agent_type` 為空的 `SubagentStop`（推測是 Claude Code 內部 agent）。
   - 決定：`tm hook-state idle` 收到的 `background_tasks` 中有 `type: subagent` 且 `status: running` 的項目時，改寫 `working`（`since` 沿用），不寫 `idle`。只看 subagent，背景 shell（例如 dev server）可能永遠不結束。不安裝 `SubagentStop`。尚未實測背景 Bash 指令在 `background_tasks` 中的 `type`，依此規則不會被計入。
   - 同次調查的其他發現：
-    - `notification_type` 文件列出 13 種，目前只處理 4 種。`elicitation_url_dialog`（MCP 要求開瀏覽器）與 `agent_needs_input`（背景 session 等待輸入）應評估是否算 `blocked`；其餘（`agent_completed`、`quota_auto_resume_*`、`plugin_notification`、`elicitation_complete`、`elicitation_response`）不是等待使用者的訊號。
+    - `notification_type` 文件列出 13 種。其餘（`agent_completed`、`quota_auto_resume_*`、`plugin_notification`、`elicitation_complete`、`elicitation_response`）不是等待使用者的訊號。
+    - `elicitation_url_dialog`（MCP server 要求開瀏覽器網址）：與 `elicitation_dialog` 同樣是前景 session 在等使用者，改寫 `blocked`、reason `input`。尚未實測（需要會發出 URL 模式 elicitation 的 MCP server），依文件語意比照 `elicitation_dialog`。
+    - `agent_needs_input` 真機實測（2026-10-23，Claude Code 2.1.309，`claude agents` 派出需要權限的背景 session）：通知在 agent view 所在的 pane 觸發，`session_id` 是 agent view 自己的，payload 沒有背景 session 的 id；背景 session 本身的 hook 都沒有 `$TMUX_PANE`，所以它的 `permission_prompt` 會被忽略。背景 session 被核准或結束後，agent view 的 pane 不會再收到任何事件。決定：不寫檔，否則 agent view 的 pane 會停在 `blocked` 直到關閉；背景 session 不屬於任何 pane，由 agent view 自己顯示 Needs input。
     - 權限提示約等 6 秒才送 `permission_prompt`，在那之前會先顯示 `⏳`。
     - 互動模式下，接受信任對話框之前，所有設定檔的 hook（含 `~/.claude/settings.json`）都不會執行，與 README 的說法一致；`-p` 與 SDK 不顯示對話框、視為已信任。
     - 使用者拒絕權限或按 Esc 中斷，沒有對應的 hook（`PermissionDenied` 只用於 auto mode），所以 PR 1 記錄的「`❓` 留到下一個 prompt」是已知限制，文件層面無解。

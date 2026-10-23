@@ -62,6 +62,21 @@ test_blocked_input_by_type() {
   assert_eq input "$(field reason)" elicitation_dialog
 }
 
+test_blocked_input_for_url_elicitation() {
+  # An MCP server asks the user to open a URL: same wait as the form dialog
+  hook blocked '{"hook_event_name":"Notification","notification_type":"elicitation_url_dialog","message":"x"}'
+  assert_eq blocked "$(field state)" state
+  assert_eq input "$(field reason)" elicitation_url_dialog
+}
+
+test_agent_needs_input_ignored() {
+  # Real Claude Code 2.1.309 payload (2026-10-23): fired in the agent view
+  # pane for a background session that has no pane; nothing would ever clear
+  # the block, so the agent view pane must not turn blocked
+  hook blocked '{"hook_event_name":"Notification","notification_type":"agent_needs_input","message":"task needs your input: approve Bash: touch /tmp/x"}'
+  [[ ! -e "$STATE_DIR/7.json" ]] || fail "file created for agent_needs_input"
+}
+
 # idle_prompt fires ~60 s after every Stop; the turn is already idle, so it
 # must not flip the pane to blocked
 test_idle_prompt_keeps_idle() {

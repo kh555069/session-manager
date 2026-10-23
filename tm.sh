@@ -2313,11 +2313,12 @@ if state == "blocked":
     ntype = payload.get("notification_type")
     if ntype == "permission_prompt":
         reason = "permission"
-    elif ntype == "elicitation_dialog":
+    elif ntype in ("elicitation_dialog", "elicitation_url_dialog"):
         reason = "input"
     elif ntype:
         # e.g. idle_prompt (sent ~60 s after every Stop, the turn is already
-        # idle) or auth_success: not a request for human input
+        # idle), auth_success, or agent_needs_input (sent to the agent view
+        # pane for a paneless background session; nothing would clear it)
         sys.exit(0)
     elif "permission" in str(message or "").lower():
         reason = "permission"
