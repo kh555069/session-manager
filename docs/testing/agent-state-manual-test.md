@@ -44,6 +44,8 @@ bash tests/run.sh
 
 ## 4. 等待權限
 
+本節的權限畫面也用在 13-2、14-2、15-2 與第 16 步。先執行 `jq '.permissions' ~/.claude/settings.json` 確認設定：`allow` 含有 `"Bash"`（允許所有 Bash 指令）時，`touch` 不會跳出權限畫面，也就不會出現 `❓`。這時第 2 步改用 `claude --settings '{"permissions":{"ask":["Bash(touch:*)"]}}'` 啟動 Claude，讓 `touch` 一律詢問（`ask` 規則優先於 `allow`；此做法尚未實測，若仍沒有權限畫面，改用其他不在 `allow` 清單裡的工具）。
+
 | 步驟 | 操作 | 預期 |
 |------|------|------|
 | 4-1 | 請 Claude 做一件需要核准的事，例如「用 Bash 執行 `touch /tmp/tm-test`」，先**不要**回答權限畫面 | 列表顯示 `❓`，`state-test` 排到最上面 |
