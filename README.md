@@ -366,7 +366,7 @@ tm wait --all --until done --after-change --match any
 - Still wait for `done` rather than `idle`: once hooks run, permission and input prompts show up as `blocked`.
 - Codex reports no hook states, so its agents stay `unknown` and never reach `done`; keep using `agent-state.sh` for Codex Workers.
 - When `agent-prompt.sh` returns `12` the text may still be in the input box; resending would create two tasks, so a person has to decide first.
-- `tm wait` is a candidate replacement for `agent-state.sh wait`; until the Leader rules change, Worker state is still read with `agent-state.sh`.
+- The Leader rules keep `agent-state.sh` as the only source of Worker state; since 2026-10-23 it reads the hook state from `tm ls --json` to settle ambiguous screens (such as a short reply with no done line), while dialogs, spinners and `not-running` stay screen-based.
 
 ## Overview and Notifications
 

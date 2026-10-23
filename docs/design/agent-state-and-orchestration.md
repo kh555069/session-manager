@@ -274,7 +274,7 @@ tm wait --all --until done --after-change --match any
 - 仍然用 `--until done` 而不是 `idle`：hook 開始執行後，權限確認與要求輸入會以 `blocked` 呈現。
 - Codex 不回報 hook 狀態，agent 一律是 `unknown`，永遠不會達成 `done`；Codex Worker 仍以 `agent-state.sh` 判讀。
 - `agent-prompt.sh` 回 `12` 時文字可能還留在輸入框，重送會變成兩份任務，必須先交給使用者判斷。
-- 本節的 `tm wait` 是 `agent-state.sh wait` 的候選替代；在 Leader 規則改版前，Worker 狀態判讀仍以 `agent-state.sh` 為準。
+- 本節的 `tm wait` 是 `agent-state.sh wait` 的候選替代，Leader 沒有改用。2026-10-23 決定採混合判讀：Leader 規則仍以 `agent-state.sh` 為唯一來源，由它在 Claude Code pane 讀 `tm ls --json` 的 hook 狀態（catalog-manager `b015ad8`）。畫面判讀為 `unknown` 時採用 hook 狀態（`idle` 另需輸入框為空）；畫面是上一輪的 done 行、hook 是未逾時的 working 且畫面沒有 `Interrupted` 時判為 working；對話框、spinner、`not-running` 一律以畫面為準。不全面改用 `tm wait` 的原因：信任資料夾等啟動對話框在 hook 執行前出現，`tm` 只能回 `unknown`；`do-restart.sh` 要靠 `not-running` 確認 pane 回到 shell；`RULE`／`MATCHED` 的畫面文字會顯示給使用者；中斷（Esc）不送 `Stop`，hook 的 working／blocked 可能殘留。
 
 ### 實作方式
 
@@ -414,7 +414,7 @@ Notification 的 `message` 可能含指令內容或路徑，送到外部服務�
     - 權限提示約等 6 秒才送 `permission_prompt`，在那之前會先顯示 `⏳`。
     - 互動模式下，接受信任對話框之前，所有設定檔的 hook（含 `~/.claude/settings.json`）都不會執行，與 README 的說法一致；`-p` 與 SDK 不顯示對話框、視為已信任。
     - 使用者拒絕權限或按 Esc 中斷，沒有對應的 hook（`PermissionDenied` 只用於 auto mode），所以 PR 1 記錄的「`❓` 留到下一個 prompt」是已知限制，文件層面無解。
-- [ ] Codex 的 `working` 與 `blocked` 是否有更可靠的訊號，可以取代畫面比對？
+- [x] Codex 的 `working` 與 `blocked` 是否有更可靠的訊號，可以取代畫面比對？（2026-10-23 使用者停用 Codex，不再處理；以下調查結果保留備查）
   - 文件與原始碼調查（2026-10-22，codex-cli 0.163.0，官方 hooks／config 文件與 `openai/codex` 的 `rust-v0.163.0` 原始碼；尚未實測）：
     - **Codex 有與 Claude Code 相容的 hook 系統**，0.163 預設啟用：`~/.codex/hooks.json` 或 `config.toml` 的 `[hooks]`，格式是事件 → matcher → handler，stdin 收 JSON（`session_id`、`cwd`、`hook_event_name`、多數事件有 `turn_id`）。事件有 SessionStart、SessionEnd、PreToolUse、PostToolUse、PermissionRequest、UserPromptSubmit、SubagentStart、SubagentStop、Stop、Interrupt 等。非 managed 的 hook 要在 `/hooks` 審閱信任一次。
     - **舊的 `notify` 設定**只在 `agent-turn-complete`（一輪正常結束）時呼叫，JSON 放在最後一個 argv，fire-and-forget；原始碼標為 legacy，預期會被 hooks 取代，不建議採用。

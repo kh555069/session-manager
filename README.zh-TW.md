@@ -367,7 +367,7 @@ tm wait --all --until done --after-change --match any
 - 仍然用 `--until done` 而不是 `idle`：hook 開始執行後，權限確認與要求輸入會以 `blocked` 呈現。
 - Codex 不回報 hook 狀態，agent 一律是 `unknown`，永遠不會達成 `done`；Codex Worker 仍以 `agent-state.sh` 判讀。
 - `agent-prompt.sh` 回 `12` 時文字可能還留在輸入框，重送會變成兩份任務，必須先交給使用者判斷。
-- `tm wait` 是 `agent-state.sh wait` 的候選替代；在 Leader 規則改版前，Worker 狀態判讀仍以 `agent-state.sh` 為準。
+- Leader 規則仍以 `agent-state.sh` 為 Worker 狀態的唯一來源；自 2026-10-23 起它會讀 `tm ls --json` 的 hook 狀態，補足畫面判讀不明確的情況（例如沒有 done 行的短回覆），對話框、spinner 與 `not-running` 仍以畫面為準。
 
 ## 狀態總覽與通知
 
