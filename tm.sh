@@ -234,6 +234,48 @@ def clean(value):
     text = _controls.sub(" ", _escapes.sub("", str(value))) if value else ""
     return " ".join(text.split()) or "-"
 
+_INTERRUPT = "[Request interrupted by user"
+
+def interrupted_at(path, after):
+    """Epoch of a user interrupt that ended the last turn, if not before after.
+
+    Claude Code sends no hook on Esc or Ctrl-C; the transcript ends the turn
+    with a user entry "[Request interrupted by user...]" instead. Only the
+    last user or assistant entry counts (metadata such as turn_duration may
+    follow it), so a new prompt after an old interrupt is not one.
+    """
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 65536))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue  # the first line of the tail may be cut
+        if not isinstance(entry, dict) or entry.get("isSidechain") \
+                or entry.get("type") not in ("user", "assistant"):
+            continue
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            texts = [content]
+        elif isinstance(content, list):
+            texts = [c.get("text") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+        else:
+            texts = []
+        if entry.get("type") != "user" or not any(
+                isinstance(t, str) and t.startswith(_INTERRUPT) for t in texts):
+            return None
+        ts = epoch(str(entry.get("timestamp"))[:19] + "Z")
+        return ts if ts is not None and ts >= after else None
+    return None
+
 def load_state(state_dir, pane, created, now, stale_after):
     """Validated state of one pane, or None when its state file is unusable.
 
@@ -262,9 +304,15 @@ def load_state(state_dir, pane, created, now, stale_after):
         return None
     if state == "dead":
         state = "unknown"
+    since = epoch(record.get("since")) or ts
+    if state in ("working", "blocked"):
+        interrupted = interrupted_at(record.get("transcript_path"), ts)
+        if interrupted is not None:
+            state, since, ts = "idle", interrupted, interrupted
+            record["reason"] = record["message"] = None
     stale = state == "working" and now - ts > stale_after
     return {"state": state, "stale": stale, "ts": ts,
-            "since": epoch(record.get("since")) or ts, "record": record}
+            "since": since, "record": record}
 '
 
 # Read agent state files for the panes given on stdin.
@@ -2369,6 +2417,8 @@ record = {
     "message": message,
     "event": payload.get("hook_event_name"),
     "cwd": payload.get("cwd"),
+    # Read back to spot an interrupt, which sends no hook
+    "transcript_path": payload.get("transcript_path") if isinstance(payload.get("transcript_path"), str) else None,
     "ts": now,
     "since": since,
     "notified_at": notified_at,

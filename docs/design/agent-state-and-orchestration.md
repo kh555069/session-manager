@@ -33,7 +33,7 @@ tm.sh 補上三項能力，讓 Leader Agent 可以用 CLI 管理 Worker，不必
 
 圖中只畫會寫入狀態檔的 4 個狀態；`unknown` 是讀取端在沒有狀態檔時推得的，不參與轉移，所以不在圖中。正常循環是 idle 與 working 之間來回；只有 blocked 需要人或 Leader 介入，任一狀態都可能因 SessionEnd 進入 dead。
 
-`PreToolUse` 在權限確認**之前**觸發，所以使用者核准後真正把 `blocked` 拉回 `working` 的是 `PostToolUse`；只靠 `PreToolUse` 的話，核准後整段工具執行期間都會停在 `blocked`。使用者拒絕或按 Esc 中斷時沒有 `PostToolUse`，`blocked` 會留到下一個 prompt。這兩個 hook 觸發頻繁，寫入必須夠輕（見下方效能限制）。
+`PreToolUse` 在權限確認**之前**觸發，所以使用者核准後真正把 `blocked` 拉回 `working` 的是 `PostToolUse`；只靠 `PreToolUse` 的話，核准後整段工具執行期間都會停在 `blocked`。使用者拒絕或按 Esc 中斷時沒有 `PostToolUse`，也沒有 `Stop`；讀取端改由 transcript 判斷中斷（見下方待確認問題的實測紀錄）。這兩個 hook 觸發頻繁，寫入必須夠輕（見下方效能限制）。
 
 `Notification` 只有權限確認（`permission_prompt`）與要求輸入（`elicitation_dialog`、`elicitation_url_dialog`）寫 `blocked`。`idle_prompt` 是每次 `Stop` 約 60 秒後的閒置提醒，這時一輪已經結束、狀態已是 `idle`，不寫檔；否則每個做完的 session 都會在一分鐘後變成 `blocked` 並置頂。
 
@@ -414,6 +414,8 @@ Notification 的 `message` 可能含指令內容或路徑，送到外部服務�
     - 權限提示約等 6 秒才送 `permission_prompt`，在那之前會先顯示 `⏳`。
     - 互動模式下，接受信任對話框之前，所有設定檔的 hook（含 `~/.claude/settings.json`）都不會執行，與 README 的說法一致；`-p` 與 SDK 不顯示對話框、視為已信任。
     - 使用者拒絕權限或按 Esc 中斷，沒有對應的 hook（`PermissionDenied` 只用於 auto mode），所以 PR 1 記錄的「`❓` 留到下一個 prompt」是已知限制，文件層面無解。
+    - 中斷實測（2026-10-23，Claude Code 2.1.309，logger 掛 21 種事件，排除會改變行為的 `WorktreeCreate`／`WorktreeRemove` 等）：串流中、等待背景工具時、在權限畫面按 Esc，三種情況都沒有任何 hook，狀態停在 `working`／`blocked`。transcript 會在這一輪最後寫一筆 user 訊息 `[Request interrupted by user]`（權限畫面為 `… for tool use]`，後面接 `system/turn_duration` 等 metadata）。還沒輸出就按 Esc 時，Claude Code 把 prompt 還原到輸入框，transcript 不留任何標記。`PermissionRequest` 在權限畫面出現的同一秒觸發，比 `permission_prompt` 通知早約 6 秒（尚未採用）。
+    - 決定：狀態檔多記 `transcript_path`；讀取端（`load_state`，`ls --json`、dash、`state-count`、`wait` 共用）對 `working`／`blocked` 讀 transcript 檔尾 64 KB，最後一筆 user／assistant 紀錄（略過 sidechain 與 metadata）是中斷標記、且時間不早於狀態紀錄時，視為 `idle`，`since` 為中斷時間，`reason`／`message` 清空。每個 agent 約 0.1 ms。標記字串沒有文件保證，格式改變時退回原本行為（停在 `working`，由 `TM_STALE_AFTER` 兜底）；還沒輸出就中斷的情況仍偵測不到。
 - [x] Codex 的 `working` 與 `blocked` 是否有更可靠的訊號，可以取代畫面比對？（2026-10-23 使用者停用 Codex，不再處理；以下調查結果保留備查）
   - 文件與原始碼調查（2026-10-22，codex-cli 0.163.0，官方 hooks／config 文件與 `openai/codex` 的 `rust-v0.163.0` 原始碼；尚未實測）：
     - **Codex 有與 Claude Code 相容的 hook 系統**，0.163 預設啟用：`~/.codex/hooks.json` 或 `config.toml` 的 `[hooks]`，格式是事件 → matcher → handler，stdin 收 JSON（`session_id`、`cwd`、`hook_event_name`、多數事件有 `turn_id`）。事件有 SessionStart、SessionEnd、PreToolUse、PostToolUse、PermissionRequest、UserPromptSubmit、SubagentStart、SubagentStop、Stop、Interrupt 等。非 managed 的 hook 要在 `/hooks` 審閱信任一次。
