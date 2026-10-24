@@ -54,8 +54,6 @@ readonly CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
 # Parked sessions: closed with Ctrl-X, revived with claude --resume
 readonly PARKED_DIR="${CONFIG_DIR}/parked"
 readonly CLAUDE_CMD="${TM_CLAUDE_CMD:-claude}"
-# Same flags as `tm restore --claude`
-readonly CLAUDE_RESUME_FLAGS="--dangerously-skip-permissions"
 readonly SCRIPT_DIR="${SELF%/*}"
 readonly SNAPSHOT_DIR="${SCRIPT_DIR}/snapshots"
 readonly SNAPSHOT_FILE="${SNAPSHOT_DIR}/sessions.json"
@@ -905,17 +903,58 @@ for entry in sorted(os.listdir(sys.argv[1])):
 }
 
 # Claude agents of a live session that can be resumed, one JSON object per
-# line: target, state, session_id (a UUID from the hook), cwd, transcript_path
+# line: target, state, session_id (a UUID from the hook), cwd,
+# transcript_path, and flags: the permission flags the claude process was
+# started with (--dangerously-skip-permissions, --permission-mode MODE), so a
+# revive never runs an agent with more permission than it had.
 _resumable_agents() {
   tmux list-panes -s -t "=$1" \
-    -F $'#{session_name}\t#{pane_id}\t#{session_created}\t#{window_index}.#{pane_index}\t#{pane_current_path}' 2>/dev/null \
+    -F $'#{session_name}\t#{pane_id}\t#{session_created}\t#{window_index}.#{pane_index}\t#{pane_current_path}\t#{pane_pid}' 2>/dev/null \
     | python3 -I -S -c "${_PY_STATE_LIB}"'
-import uuid
+import subprocess, uuid
+
+def process_table():
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,command="],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}, {}
+    children, commands = {}, {}
+    for row in out.splitlines():
+        fields = row.split(None, 2)
+        if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+            children.setdefault(fields[1], []).append(fields[0])
+            commands[fields[0]] = fields[2] if len(fields) == 3 else ""
+    return children, commands
+
+def permission_flags(root, children, commands):
+    """Permission flags of the first process under the pane naming claude."""
+    queue = [root]
+    while queue:
+        pid = queue.pop(0)
+        words = commands.get(pid, "").split()
+        if any(os.path.basename(w) == "claude" for w in words):
+            flags = []
+            for i, word in enumerate(words):
+                mode = None
+                if word == "--dangerously-skip-permissions":
+                    flags.append(word)
+                elif word == "--permission-mode" and i + 1 < len(words):
+                    mode = words[i + 1]
+                elif word.startswith("--permission-mode="):
+                    mode = word.split("=", 1)[1]
+                if mode is not None and re.fullmatch(r"[A-Za-z]+", mode):
+                    flags += ["--permission-mode", mode]
+            return flags
+        queue += children.get(pid, [])
+    return []
+
+children, commands = process_table()
 for line in sys.stdin:
     parts = line.rstrip("\n").split("\t")
-    if len(parts) != 5:
+    if len(parts) != 6:
         continue
-    _session, pane, created, target, pane_path = parts
+    _session, pane, created, target, pane_path, pane_pid = parts
     loaded = load_state(sys.argv[1], pane, created, time.time(), 10 ** 9)
     if loaded is None or loaded["state"] == "unknown":
         continue
@@ -927,7 +966,8 @@ for line in sys.stdin:
     cwd = record.get("cwd") if isinstance(record.get("cwd"), str) and record.get("cwd") else pane_path
     path = record.get("transcript_path")
     print(json.dumps({"target": target, "state": loaded["state"], "session_id": session_id,
-                      "cwd": cwd, "transcript_path": path if isinstance(path, str) else None}))
+                      "cwd": cwd, "transcript_path": path if isinstance(path, str) else None,
+                      "flags": permission_flags(pane_pid, children, commands)}))
 ' "$STATE_DIR" 2>/dev/null || true
 }
 
@@ -1015,7 +1055,8 @@ os.replace(tmp, file)
 }
 
 # tm revive NAME / Enter on a parked row: recreate the session, one window
-# per agent in its directory, each running claude --resume <id>.
+# per agent in its directory, each running claude --resume <id> with the
+# permission flags recorded at park time (none when it had none).
 # Returns 2 when NAME is not parked, 1 when it cannot be revived.
 _cmd_revive() {
   local name="${1:-}" file
@@ -1045,21 +1086,34 @@ for agent in record.get("agents") or []:
         continue
     cwd = agent.get("cwd")
     cwd = cwd if isinstance(cwd, str) and os.path.isdir(cwd) and "\t" not in cwd else fallback
-    print(cwd + "\t" + sid)
+    # Only the two permission flags, checked again: the record is a file
+    words = agent.get("flags") if isinstance(agent.get("flags"), list) else []
+    flags = []
+    for i, word in enumerate(words):
+        if word == "--dangerously-skip-permissions":
+            flags.append(word)
+        elif word == "--permission-mode" and i + 1 < len(words) \
+                and isinstance(words[i + 1], str) and words[i + 1].isascii() and words[i + 1].isalpha():
+            flags += [word, words[i + 1]]
+    print("\t".join([cwd, sid] + flags))
 ' "$file") || agents=""
   if [[ -z "$agents" ]]; then
     printf '%s✗ The parked record of %s has no agent to resume%s\n' "$C_RED" "$name" "$C_RESET" >&2
     return 1
   fi
 
-  local cwd sid window cmd count=0
-  while IFS=$'\t' read -r cwd sid; do
+  local cwd sid flags window cmd flag count=0
+  while IFS=$'\t' read -r cwd sid flags; do
     if [[ $count -eq 0 ]]; then
       window=$(tmux new-session -d -s "$name" -c "$cwd" -P -F '#{window_id}') || return 1
     else
       window=$(tmux new-window -d -t "=$name:" -c "$cwd" -P -F '#{window_id}') || return 1
     fi
-    printf -v cmd '%q --resume %q %s' "$CLAUDE_CMD" "$sid" "$CLAUDE_RESUME_FLAGS"
+    printf -v cmd '%q --resume %q' "$CLAUDE_CMD" "$sid"
+    # Recorded flags are plain words (checked above), split on their tabs
+    for flag in ${flags//$'\t'/ }; do
+      printf -v cmd '%s %q' "$cmd" "$flag"
+    done
     tmux send-keys -t "$window" "$cmd" Enter
     count=$((count + 1))
   done <<< "$agents"

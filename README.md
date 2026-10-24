@@ -165,7 +165,7 @@ Works on desktop and mobile — attach to the same remote tmux sessions from any
 #### Parking sessions
 
 - `Ctrl-X` (or `tm park <name>`) closes a session that runs Claude agents but keeps a `⏸ parked` row. It records each agent's conversation ID and directory in `~/.tmux-manager/parked/` (owner-only).
-- `Enter` on the row (or `tm revive <name>`) recreates the session with one window per agent in its directory, each running `claude --resume <id> --dangerously-skip-permissions` (the same flags as `tm restore --claude`; `TM_CLAUDE_CMD` changes the command).
+- `Enter` on the row (or `tm revive <name>`) recreates the session with one window per agent in its directory, each running `claude --resume <id>`. It passes only the permission flags the agent was started with (`--dangerously-skip-permissions` or `--permission-mode <mode>`, read from its process at park time), so a revived agent never gets more permission than it had. `TM_CLAUDE_CMD` changes the command.
 - Parking asks `y` when every agent is idle; when one is working or waiting, its current turn would be lost, so you type the session name. Protected and current sessions cannot be parked, and a session without a Claude agent is closed with `Ctrl-K` instead.
 - Only Claude panes come back; use `tm save` and `tm restore` to keep a full layout. A live session with the same name hides the parked row, and reviving refuses until the name is free.
 - `Ctrl-K` on a parked row forgets it; the conversations stay in Claude's history. The preview of a parked row shows its agents and their last turn.

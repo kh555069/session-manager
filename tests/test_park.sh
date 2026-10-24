@@ -112,13 +112,44 @@ test_revive_resumes_each_agent_in_its_directory() {
   [[ ! -f "$(parked_file a)" ]] || fail "record kept after revive"
 }
 
-test_revive_passes_resume_flags() {
+test_revive_adds_no_permission_flags_of_its_own() {
   park_env
   agent_session a
   printf 'y\n' | "$TM" _park a >/dev/null
   "$TM" revive a >/dev/null
   wait_resumed 1 || fail "not resumed"
-  assert_contains "$(cat "$TEST_TMP/resumed.log")" "--dangerously-skip-permissions" flags
+  assert_not_contains "$(cat "$TEST_TMP/resumed.log")" "--dangerously-skip-permissions" no-bypass
+  assert_not_contains "$(cat "$TEST_TMP/resumed.log")" "--permission-mode" no-mode
+}
+
+# keeps_flags <claude args> <expected in the resumed command>
+keeps_flags() {
+  [[ -x "$TEST_TMP/bin/claude" ]] || fake_agent claude
+  tmux new-session -d -s a -c "$TEST_TMP/proj" "$TEST_TMP/bin/claude $1 --model x"
+  sleep 0.3
+  set_state a idle "{\"session_id\":\"$ID1\",\"cwd\":\"$TEST_TMP/proj\"}"
+  printf 'y\n' | "$TM" _park a >/dev/null
+  "$TM" revive a >/dev/null
+  wait_resumed 1 || fail "not resumed"
+  assert_eq "$TEST_TMP/proj|--resume $ID1${2:+ $2}" "$(cat "$TEST_TMP/resumed.log")" "flags for <$1>"
+  assert_not_contains "$(cat "$TEST_TMP/resumed.log")" "--model" only-permission-flags
+}
+
+test_revive_keeps_the_bypass_flag_it_was_started_with() {
+  park_env
+  keeps_flags "--dangerously-skip-permissions" "--dangerously-skip-permissions"
+}
+
+test_revive_keeps_the_permission_mode() {
+  park_env
+  keeps_flags "--permission-mode plan" "--permission-mode plan"
+}
+
+test_revive_drops_an_odd_permission_mode() {
+  park_env
+  # Quoted so the pane shell hands it to claude as one argument
+  keeps_flags "'--permission-mode=x;touch'" ""
+  assert_not_contains "$(cat "$TEST_TMP/resumed.log")" "touch" no-injection
 }
 
 test_revive_refuses_when_name_is_taken() {

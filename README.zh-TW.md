@@ -166,7 +166,7 @@ alias tm="~/session-manager/tm.sh"
 #### Park（暫停）session
 
 - `Ctrl-X`（或 `tm park <名稱>`）會關閉有 Claude agent 的 session，但保留一列 `⏸ parked`，並把每個 agent 的對話 ID 與目錄記在 `~/.tmux-manager/parked/`（僅擁有者可讀）。
-- 在該列按 `Enter`（或 `tm revive <名稱>`）會重建 session：每個 agent 一個視窗，在原目錄執行 `claude --resume <id> --dangerously-skip-permissions`（與 `tm restore --claude` 相同的參數；可用 `TM_CLAUDE_CMD` 換指令）。
+- 在該列按 `Enter`（或 `tm revive <名稱>`）會重建 session：每個 agent 一個視窗，在原目錄執行 `claude --resume <id>`。只會帶上該 agent 原本啟動時的權限參數（`--dangerously-skip-permissions` 或 `--permission-mode <模式>`，park 時從它的程序讀取），所以接回的 agent 不會拿到比原本更大的權限。可用 `TM_CLAUDE_CMD` 換指令。
 - 所有 agent 都 idle 時只要輸入 `y`；有 agent 正在工作或等待時，目前這一輪會中斷，所以要輸入 session 名稱確認。受保護的 session 與目前所在的 session 不能 park；沒有 Claude agent 的 session 請改用 `Ctrl-K` 關閉。
 - 只會接回 Claude pane；要保留完整版面請用 `tm save` 與 `tm restore`。同名的 session 還在執行時，parked 列會隱藏，接回也會拒絕，直到名稱空出來。
 - 在 parked 列按 `Ctrl-K` 會刪除紀錄，對話仍留在 Claude 的歷史裡。parked 列的 preview 會列出它的 agent 與最後一輪的內容。
