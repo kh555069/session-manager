@@ -146,7 +146,8 @@ alias tm="~/session-manager/tm.sh"
 | `Ctrl-G`  | 把選取的 session 放進群組（名稱留空：回到依目錄分組） |
 | `Tab`     | 多選（搭配 `Ctrl-K` 批量刪除）  |
 | `Ctrl-N`  | 新建 Session                   |
-| `Ctrl-K`  | 關閉 Session（支援多選批量刪除）|
+| `Ctrl-K`  | 關閉 Session（支援多選批量刪除）；在 parked 列上：刪除紀錄 |
+| `Ctrl-X`  | Park：關閉 session 但保留這一列；之後在該列按 `Enter` 接回 Claude agent |
 | `Ctrl-E`  | 重新命名 Session               |
 | `Ctrl-D`  | 踢除其他連線                   |
 | `Ctrl-P`  | 切換保護鎖 🔒                   |
@@ -162,6 +163,14 @@ alias tm="~/session-manager/tm.sh"
 - 有 blocked agent 的群組跟 session 一樣排到最上面；群組內 blocked 的 session 排在前面。
 - 自訂群組存在 `~/.tmux-manager/groups.tsv`，折疊狀態存在 `~/.tmux-manager/folded.txt`。設定 `TM_GROUPS=off` 可改回平面清單。
 
+#### Park（暫停）session
+
+- `Ctrl-X`（或 `tm park <名稱>`）會關閉有 Claude agent 的 session，但保留一列 `⏸ parked`，並把每個 agent 的對話 ID 與目錄記在 `~/.tmux-manager/parked/`（僅擁有者可讀）。
+- 在該列按 `Enter`（或 `tm revive <名稱>`）會重建 session：每個 agent 一個視窗，在原目錄執行 `claude --resume <id> --dangerously-skip-permissions`（與 `tm restore --claude` 相同的參數；可用 `TM_CLAUDE_CMD` 換指令）。
+- 所有 agent 都 idle 時只要輸入 `y`；有 agent 正在工作或等待時，目前這一輪會中斷，所以要輸入 session 名稱確認。受保護的 session 與目前所在的 session 不能 park；沒有 Claude agent 的 session 請改用 `Ctrl-K` 關閉。
+- 只會接回 Claude pane；要保留完整版面請用 `tm save` 與 `tm restore`。同名的 session 還在執行時，parked 列會隱藏，接回也會拒絕，直到名稱空出來。
+- 在 parked 列按 `Ctrl-K` 會刪除紀錄，對話仍留在 Claude 的歷史裡。parked 列的 preview 會列出它的 agent 與最後一輪的內容。
+
 ### CLI 模式
 
 ```bash
@@ -173,6 +182,8 @@ tm kill myapp               # 關閉 session（有防呆）
 tm attach myapp -d          # 進入 session，踢除其他連線
 tm rename myapp             # 重新命名 session
 tm group crawlers a b       # 把 session 放進群組（--clear：回到依目錄分組）
+tm park myapp               # 關閉 session，保留這一列以便之後接回
+tm revive myapp             # 重建 session 並接回 Claude 對話
 tm last                     # 切回上一個 session
 tm ls                       # 純文字列出所有 session
 tm templates                # 列出可用模板
@@ -462,6 +473,7 @@ export TM_NOTIFY_CMD='jq -r "\(.host)/\(.tmux_session) \(.state): \(.message // 
 | `TM_SNAPSHOT_KEEP` | `48`                 | `tm save` 保留的帶時間戳快照份數 |
 | `TM_SORT`          | （未設定）            | 設為 `recent` 時不把 blocked 排到最上面 |
 | `TM_GROUPS`        | `on`                 | 設為 `off` 時顯示不分組的平面清單 |
+| `TM_CLAUDE_CMD`    | `claude`             | 接回 parked session 時使用的 Claude 指令 |
 | `TM_STALE_AFTER`   | `1800`               | working 超過幾秒沒有 hook 更新就顯示 `⏳?` |
 | `TM_NOTIFY_CMD`    | （未設定）           | agent 狀態轉換時執行的指令（見推播通知） |
 | `TM_NOTIFY_ON`     | `blocked`            | 要通知的狀態，逗號分隔 |

@@ -51,6 +51,11 @@ else
 fi
 readonly CLAUDE_PROJECTS="${HOME}/.claude/projects"
 readonly CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
+# Parked sessions: closed with Ctrl-X, revived with claude --resume
+readonly PARKED_DIR="${CONFIG_DIR}/parked"
+readonly CLAUDE_CMD="${TM_CLAUDE_CMD:-claude}"
+# Same flags as `tm restore --claude`
+readonly CLAUDE_RESUME_FLAGS="--dangerously-skip-permissions"
 readonly SCRIPT_DIR="${SELF%/*}"
 readonly SNAPSHOT_DIR="${SCRIPT_DIR}/snapshots"
 readonly SNAPSHOT_FILE="${SNAPSHOT_DIR}/sessions.json"
@@ -689,8 +694,11 @@ _sanitize_group() {
 # even with one. Returns 1 when there are no sessions.
 _collect_sessions() {
   local fmt='#{session_name};#{session_attached};#{session_windows};#{session_path};#{session_last_attached};#{session_activity}'
-  local raw
+  local raw parked
   raw=$(tmux list-sessions -F "$fmt" 2>/dev/null) || true
+  # Parked sessions join as "NAME;P;-;PATH;PARKED_AT;PARKED_AT" (P marks them)
+  parked=$(_parked_rows "$raw")
+  [[ -n "$parked" ]] && raw+="${raw:+$'\n'}${parked}"
   [[ -n "$raw" ]] || return 1
   _build_list_cache
   _S_NAME=(); _S_ATT=(); _S_WIN=(); _S_PATH=(); _S_ACT=(); _S_STATE=(); _S_GROUP=()
@@ -699,8 +707,12 @@ _collect_sessions() {
   while IFS=';' read -r name attached windows path _last activity; do
     _S_NAME[n]="$name"; _S_ATT[n]="$attached"; _S_WIN[n]="$windows"
     _S_PATH[n]="$path"; _S_ACT[n]="$activity"
-    _session_agent_state "$name"
-    _S_STATE[n]="$_AGENT_STATE"
+    if [[ "$attached" == "P" ]]; then
+      _S_STATE[n]="parked"
+    else
+      _session_agent_state "$name"
+      _S_STATE[n]="$_AGENT_STATE"
+    fi
     manual[n]=""; auto[n]=""
     if _groups_enabled; then
       _manual_group "$name"; manual[n]="$_GROUP"
@@ -734,7 +746,7 @@ _in_pass() {
 # shows state counts and, when folded, the session names, so a query typed
 # in fzf still finds the group of a hidden session.
 _print_group() {
-  local key="$1" i n=${#_S_NAME[@]} blocked=0 working=0 idle=0 total=0
+  local key="$1" i n=${#_S_NAME[@]} blocked=0 working=0 idle=0 parked=0 total=0
   local names="" folded=0 pass group_state=rest
   for ((i = 0; i < n; i++)); do
     [[ "${_S_GROUP[i]}" == "$key" ]] || continue
@@ -743,6 +755,7 @@ _print_group() {
       blocked)           blocked=$((blocked + 1)) ;;
       working|working\?) working=$((working + 1)) ;;
       idle)              idle=$((idle + 1)) ;;
+      parked)            parked=$((parked + 1)) ;;
     esac
     names+="${names:+, }${_S_NAME[i]}"
   done
@@ -753,6 +766,7 @@ _print_group() {
   [[ $blocked -gt 0 ]] && counts+="${C_RED}❓${blocked}${C_RESET} "
   [[ $working -gt 0 ]] && counts+="⏳${working} "
   [[ $idle -gt 0 ]] && counts+="💤${idle} "
+  [[ $parked -gt 0 ]] && counts+="⏸${parked} "
   counts+="(${total})"
   [[ $folded -eq 1 ]] && counts+="  ${C_DIM}${names}${C_RESET}"
   printf "%s\t%-20s\t%s\n" "${C_BOLD}${arrow}${C_RESET}" "${key}:" "$counts"
@@ -763,11 +777,35 @@ _print_group() {
     for ((i = 0; i < n; i++)); do
       [[ "${_S_GROUP[i]}" == "$key" ]] || continue
       _in_pass "$pass" "${_S_STATE[i]}" || continue
-      _format_session_line "${_S_NAME[i]}" "${_S_ATT[i]}" "${_S_WIN[i]}" \
-        "${_S_PATH[i]}" "${_S_ACT[i]}" "  "
+      _format_entry "$i" "  "
     done
   done
   return 0
+}
+
+# Row of session index I from _collect_sessions. Args: I [INDENT]
+_format_entry() {
+  local i="$1"
+  if [[ "${_S_ATT[i]}" == "P" ]]; then
+    _format_parked_line "${_S_NAME[i]}" "${_S_PATH[i]}" "${_S_ACT[i]}" "${2:-}"
+  else
+    _format_session_line "${_S_NAME[i]}" "${_S_ATT[i]}" "${_S_WIN[i]}" \
+      "${_S_PATH[i]}" "${_S_ACT[i]}" "${2:-}"
+  fi
+}
+
+# Row of a parked session: same columns as a live one, IDLE is time parked
+_format_parked_line() {
+  local name="$1" path="$2" parked_at="$3" indent="${4:-}"
+  local status="${C_DIM}[-]${C_RESET} ⏸" short_path="${path/#$HOME/~}" idle
+  [[ ${#short_path} -gt 30 ]] && short_path="…${short_path: -29}"
+  idle=$(_relative_time "$parked_at")
+  if _is_narrow; then
+    printf "%s\t%-16s\t%s\t%s\t%s\t%s\n" "$status" "${indent}${name}" "-" "-" "$idle" "parked"
+  else
+    printf "%s\t%-20s\t%-30s\t%s\t%s\t%s\t%s\n" \
+      "$status" "${indent}${name}" "$short_path" "-" "-" "$idle" "parked"
+  fi
 }
 
 # Group of session NAME → $_GROUP, from arrays set by _collect_sessions
@@ -827,6 +865,262 @@ _set_fold() {
   _write_list_file "$FOLDED_FILE" "$out"
 }
 
+# ─── Parked sessions ──────────────────────────────────
+# Ctrl-X closes a session with Claude agents but keeps its row: the record
+# in PARKED_DIR holds each agent's conversation ID and directory, and Enter on
+# the row recreates the session with `claude --resume`. A live session of the
+# same name hides the parked row. Only Claude panes come back; `tm save` and
+# `tm restore` keep a full layout.
+
+# Record file of a parked session ("%" and "/" escaped)
+_parked_file() {
+  local n="${1//\%/%25}"
+  printf '%s/%s.json' "$PARKED_DIR" "${n//\//%2F}"
+}
+
+# Whether NAME is a parked session with no live session of that name
+_is_parked() {
+  [[ -n "$1" && -f "$(_parked_file "$1")" ]] && ! tmux has-session -t "=$1" 2>/dev/null
+}
+
+# Parked records not shadowed by a live session, as _collect_sessions rows.
+# Args: LIVE_ROWS (tmux list-sessions output, NAME first)
+_parked_rows() {
+  compgen -G "${PARKED_DIR}/*.json" >/dev/null 2>&1 || return 0
+  python3 -I -S -c "${_PY_STATE_LIB}"'
+live = {line.split(";", 1)[0] for line in sys.argv[2].splitlines()}
+for entry in sorted(os.listdir(sys.argv[1])):
+    if not entry.endswith(".json"):
+        continue
+    try:
+        with open(os.path.join(sys.argv[1], entry)) as f:
+            record = json.load(f)
+        name, path, at = record["name"], record["path"], int(record["parked_at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        continue
+    if not isinstance(name, str) or not isinstance(path, str) or name in live             or not name or any(c in name + path for c in ";\t\n"):
+        continue
+    print(";".join([name, "P", "-", path, str(at), str(at)]))
+' "$PARKED_DIR" "$1" 2>/dev/null || true
+}
+
+# Claude agents of a live session that can be resumed, one JSON object per
+# line: target, state, session_id (a UUID from the hook), cwd, transcript_path
+_resumable_agents() {
+  tmux list-panes -s -t "=$1" \
+    -F $'#{session_name}\t#{pane_id}\t#{session_created}\t#{window_index}.#{pane_index}\t#{pane_current_path}' 2>/dev/null \
+    | python3 -I -S -c "${_PY_STATE_LIB}"'
+import uuid
+for line in sys.stdin:
+    parts = line.rstrip("\n").split("\t")
+    if len(parts) != 5:
+        continue
+    _session, pane, created, target, pane_path = parts
+    loaded = load_state(sys.argv[1], pane, created, time.time(), 10 ** 9)
+    if loaded is None or loaded["state"] == "unknown":
+        continue
+    record = loaded["record"]
+    try:
+        session_id = str(uuid.UUID(record.get("session_id") or ""))
+    except ValueError:
+        continue
+    cwd = record.get("cwd") if isinstance(record.get("cwd"), str) and record.get("cwd") else pane_path
+    path = record.get("transcript_path")
+    print(json.dumps({"target": target, "state": loaded["state"], "session_id": session_id,
+                      "cwd": cwd, "transcript_path": path if isinstance(path, str) else None}))
+' "$STATE_DIR" 2>/dev/null || true
+}
+
+# Ctrl-X / tm park NAME: close a session with Claude agents, keep its row
+_cmd_park() {
+  _parse_name "${1:-}"
+  local name="$_PARSED"
+  [[ -z "$name" ]] && return 0
+  _is_group_name "$name" && return 0
+  if _is_parked "$name"; then
+    echo -e "${C_DIM}Already parked: Enter revives it${C_RESET}"
+    sleep 0.8
+    return 0
+  fi
+  if ! tmux has-session -t "=$name" 2>/dev/null; then
+    printf '%s✗ No such session: %s%s\n' "$C_RED" "$name" "$C_RESET"
+    sleep 0.8
+    return 1
+  fi
+  if _is_protected "$name"; then
+    printf '%s%s ✗ Blocked %s Session %s is protected 🔒\n' "$C_BG_RED" "$C_WHITE" "$C_RESET" "$name"
+    sleep 1
+    return 1
+  fi
+  if [[ "$name" == "$(_current_session)" ]]; then
+    printf '%s%s ✗ Blocked %s Cannot park the current session\n' "$C_BG_RED" "$C_WHITE" "$C_RESET"
+    sleep 1
+    return 1
+  fi
+
+  local agents
+  agents=$(_resumable_agents "$name")
+  if [[ -z "$agents" ]]; then
+    printf '%s✗ No Claude agent to resume in %s: use Ctrl-K to close it%s\n' "$C_RED" "$name" "$C_RESET"
+    sleep 1.2
+    return 1
+  fi
+
+  printf '%s%sPark %s: close it, resume later with Enter%s\n' "$C_CYAN" "$C_BOLD" "$name" "$C_RESET"
+  local target state sid busy=0
+  while IFS=$'\t' read -r target state sid; do
+    _state_icon "$state"
+    printf '  %s %s  %s\n' "$_STATE_ICON" "$target" "$sid"
+    [[ "$state" == "idle" ]] || busy=1
+  done < <(printf '%s\n' "$agents" | python3 -I -S -c 'import json, sys
+for line in sys.stdin:
+    if line.strip():
+        a = json.loads(line)
+        print("\t".join([a["target"], a["state"], a["session_id"]]))')
+  local confirm=""
+  if [[ $busy -eq 1 ]]; then
+    printf '%sAn agent is still working or waiting: its current turn is lost.%s\n' "$C_YELLOW" "$C_RESET"
+    printf 'Type %s%s%s to confirm (Enter cancels):\n> ' "$C_BOLD" "$name" "$C_RESET"
+    read -r confirm || confirm=""
+    [[ "$confirm" == "$name" ]] || { echo -e "${C_GREEN}✓ Cancelled${C_RESET}"; sleep 0.5; return 0; }
+  else
+    echo -n "Park? [y/N] > "
+    read -r confirm || confirm=""
+    [[ "$confirm" == [yY] ]] || { echo -e "${C_GREEN}✓ Cancelled${C_RESET}"; sleep 0.5; return 0; }
+  fi
+
+  local path file
+  path=$(tmux display-message -p -t "=$name:" '#{session_path}' 2>/dev/null) || path="$HOME"
+  file=$(_parked_file "$name")
+  mkdir -p "$PARKED_DIR" && chmod 700 "$PARKED_DIR"
+  printf '%s\n' "$agents" | python3 -I -S -c '
+import json, os, sys, tempfile, time
+name, path, file = sys.argv[1:4]
+agents = [json.loads(line) for line in sys.stdin if line.strip()]
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(file), suffix=".tmp")
+with os.fdopen(fd, "w") as f:
+    json.dump({"v": 1, "name": name, "path": path, "parked_at": int(time.time()),
+               "agents": agents}, f, ensure_ascii=False, indent=1)
+os.replace(tmp, file)
+' "$name" "$path" "$file" || { echo -e "${C_RED}✗ Could not save the parked record${C_RESET}"; sleep 1; return 1; }
+
+  if ! tmux kill-session -t "=$name" 2>/dev/null; then
+    rm -f "$file"
+    echo -e "${C_RED}✗ Could not close the session${C_RESET}"
+    sleep 1
+    return 1
+  fi
+  printf '%s⏸ Parked: %s%s\n' "$C_GREEN" "$name" "$C_RESET"
+  sleep 0.5
+}
+
+# tm revive NAME / Enter on a parked row: recreate the session, one window
+# per agent in its directory, each running claude --resume <id>.
+# Returns 2 when NAME is not parked, 1 when it cannot be revived.
+_cmd_revive() {
+  local name="${1:-}" file
+  file=$(_parked_file "$name")
+  if [[ -z "$name" || ! -f "$file" ]]; then
+    printf '%s✗ No parked session: %s%s\n' "$C_RED" "$name" "$C_RESET" >&2
+    return 2
+  fi
+  if tmux has-session -t "=$name" 2>/dev/null; then
+    printf '%s✗ A session named %s is running: rename or close it first%s\n' "$C_RED" "$name" "$C_RESET" >&2
+    return 1
+  fi
+  local agents
+  agents=$(python3 -I -S -c '
+import json, os, sys, uuid
+try:
+    with open(sys.argv[1]) as f:
+        record = json.load(f)
+except (OSError, ValueError):
+    sys.exit(1)
+home = os.path.expanduser("~")
+fallback = record.get("path") if isinstance(record.get("path"), str) and os.path.isdir(record.get("path")) else home
+for agent in record.get("agents") or []:
+    try:
+        sid = str(uuid.UUID(agent.get("session_id") or ""))
+    except (AttributeError, ValueError):
+        continue
+    cwd = agent.get("cwd")
+    cwd = cwd if isinstance(cwd, str) and os.path.isdir(cwd) and "\t" not in cwd else fallback
+    print(cwd + "\t" + sid)
+' "$file") || agents=""
+  if [[ -z "$agents" ]]; then
+    printf '%s✗ The parked record of %s has no agent to resume%s\n' "$C_RED" "$name" "$C_RESET" >&2
+    return 1
+  fi
+
+  local cwd sid window cmd count=0
+  while IFS=$'\t' read -r cwd sid; do
+    if [[ $count -eq 0 ]]; then
+      window=$(tmux new-session -d -s "$name" -c "$cwd" -P -F '#{window_id}') || return 1
+    else
+      window=$(tmux new-window -d -t "=$name:" -c "$cwd" -P -F '#{window_id}') || return 1
+    fi
+    printf -v cmd '%q --resume %q %s' "$CLAUDE_CMD" "$sid" "$CLAUDE_RESUME_FLAGS"
+    tmux send-keys -t "$window" "$cmd" Enter
+    count=$((count + 1))
+  done <<< "$agents"
+  rm -f "$file"
+  printf '%s▶ Revived %s (%d agent(s))%s\n' "$C_GREEN" "$name" "$count" "$C_RESET"
+}
+
+# Ctrl-K on a parked row: drop its record (the conversations stay in Claude)
+_forget_parked() {
+  local name="$1" confirm=""
+  printf 'Forget parked session %s%s%s? Its conversations stay in Claude history. [y/N] > ' "$C_BOLD" "$name" "$C_RESET"
+  read -r confirm || confirm=""
+  if [[ "$confirm" == [yY] ]]; then
+    rm -f "$(_parked_file "$name")"
+    printf '%s✓ Forgot: %s%s\n' "$C_GREEN" "$name" "$C_RESET"
+  else
+    echo -e "${C_GREEN}✓ Cancelled${C_RESET}"
+  fi
+  sleep 0.5
+}
+
+# Preview of a parked row: where it was, when, and each agent's last turn
+_parked_preview() {
+  local name="$1"
+  _NOW=$(date +%s)
+  python3 -I -S -c "${_PY_STATE_LIB}"'
+name, file, cyan, green, dim, bold, reset = sys.argv[1:8]
+try:
+    with open(file) as f:
+        record = json.load(f)
+except (OSError, ValueError):
+    print("Parked record unreadable")
+    sys.exit(0)
+home = os.path.expanduser("~")
+path = clean(record.get("path"))
+if path.startswith(home):
+    path = "~" + path[len(home):]
+print(bold + "\u2500\u2500 Parked Session \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500" + reset)
+print("\U0001f3f7\ufe0f  " + cyan + clean(name) + reset)
+print("\U0001f4c2 " + path)
+try:
+    at = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(record.get("parked_at"))))
+except (TypeError, ValueError):
+    at = "?"
+print("\u23f8  parked " + at + dim + "  \u00b7  Enter: resume  \u00b7  Ctrl-K: forget" + reset)
+print("")
+print(bold + "\u2500\u2500 Agents \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500" + reset)
+for agent in record.get("agents") or []:
+    if not isinstance(agent, dict):
+        continue
+    print("  " + clean(agent.get("target")) + "  " + clean(agent.get("session_id")))
+    prompt, tools, reply, interrupted = summary_fields(agent.get("transcript_path"))
+    if prompt != "-":
+        print("     " + cyan + "You:" + reset + " " + prompt)
+    if tools != "-":
+        print("     " + dim + "\U0001f527 " + tools + reset)
+    if reply != "-":
+        print("     " + green + "Claude:" + reset + " " + reply)
+' "$name" "$(_parked_file "$name")" "$C_CYAN" "$C_GREEN" "$C_DIM" "$C_BOLD" "$C_RESET"
+}
+
 # tm group <name> <session>... | tm group --clear <session>...
 _cmd_group() {
   local usage="Usage: tm group <name> <session>... | tm group --clear <session>..."
@@ -841,7 +1135,7 @@ _cmd_group() {
     [[ -n "$group" ]] || { echo "$usage" >&2; exit 3; }
   fi
   for s in "$@"; do
-    if ! tmux has-session -t "=$s" 2>/dev/null; then
+    if ! tmux has-session -t "=$s" 2>/dev/null && ! _is_parked "$s"; then
       printf '%s✗ No such session: %s%s\n' "$C_RED" "$s" "$C_RESET" >&2
       exit 2
     fi
@@ -1063,8 +1357,7 @@ _cmd_list() {
       key="${_S_GROUP[i]}"
       if [[ -z "$key" ]]; then
         _in_pass "$pass" "${_S_STATE[i]}" || continue
-        _format_session_line "${_S_NAME[i]}" "${_S_ATT[i]}" "${_S_WIN[i]}" \
-          "${_S_PATH[i]}" "${_S_ACT[i]}"
+        _format_entry "$i"
         continue
       fi
       [[ "$seen" == *$'\n'"$key"$'\n'* ]] && continue
@@ -1086,6 +1379,10 @@ _cmd_preview() {
   local name="$_PARSED"
   if _is_group_name "$name"; then
     _group_preview "${name%:}"
+    return
+  fi
+  if _is_parked "$name"; then
+    _parked_preview "$name"
     return
   fi
 
@@ -1447,6 +1744,11 @@ _cmd_rename() {
   _parse_name "$raw_name"
   local name="$_PARSED"
   _is_group_name "$name" && return 0
+  if _is_parked "$name"; then
+    echo -e "${C_DIM}A parked session cannot be renamed: revive it first${C_RESET}"
+    sleep 0.8
+    return 0
+  fi
 
   # Prompt for new name
   echo -e "${C_CYAN}Rename session: ${name}${C_RESET}"
@@ -1501,6 +1803,7 @@ _cmd_toggle_protect() {
   _parse_name "$raw_name"
   local name="$_PARSED"
   _is_group_name "$name" && return 0
+  _is_parked "$name" && return 0
   _toggle_protect "$name"
   sleep 0.3
 }
@@ -1519,6 +1822,10 @@ _cmd_kill_selected() {
     local name="$_PARSED"
     [[ -z "$name" ]] && continue
     _is_group_name "$name" && continue
+    if _is_parked "$name"; then
+      _forget_parked "$name"
+      continue
+    fi
     _cmd_kill "$name"
   done
 }
@@ -1586,9 +1893,9 @@ _fzf_menu() {
   local fzf_header fzf_with_nth
   fzf_with_nth=$(_fzf_with_nth)
   if _is_narrow; then
-    fzf_header="↵Go Tab^Sel ←→Fold ^GGrp ^NNew ^KKill ^ERen ^DDtch ^PLock ^RRef Esc"
+    fzf_header="↵Go Tab^Sel ←→Fold ^GGrp ^NNew ^KKill ^XPark ^ERen ^DDtch ^PLock ^RRef Esc"
   else
-    fzf_header="Keys: ↵Enter │ Tab Multi-sel │ ←→ Fold │ ^G Group │ ^N New │ ^K Kill │ ^E Rename │ ^D Detach │ ^P Protect │ ^R Refresh │ ^Q Quit"
+    fzf_header="Keys: ↵Enter │ Tab Multi-sel │ ←→ Fold │ ^G Group │ ^N New │ ^K Kill │ ^X Park │ ^E Rename │ ^D Detach │ ^P Protect │ ^R Refresh │ ^Q Quit"
   fi
 
   "$SELF" _list \
@@ -1608,6 +1915,7 @@ _fzf_menu() {
         --bind="right:transform($_SELF_Q _fold expand {2})" \
         --bind="left:transform($_SELF_Q _fold collapse {2})" \
         --bind="ctrl-g:execute($_SELF_Q _group-prompt {+2} </dev/tty >/dev/tty)+reload($_SELF_Q _list)" \
+        --bind="ctrl-x:execute($_SELF_Q _park {2} </dev/tty >/dev/tty)+reload($_SELF_Q _list)" \
         --bind="ctrl-n:execute($_SELF_Q _create </dev/tty >/dev/tty)+reload($_SELF_Q _list)" \
         --bind="ctrl-k:execute($_SELF_Q _kill-selected {+2} </dev/tty >/dev/tty)+reload($_SELF_Q _list)" \
         --bind="ctrl-e:execute($_SELF_Q _rename {2} </dev/tty >/dev/tty)+reload($_SELF_Q _list)" \
@@ -1663,6 +1971,10 @@ _cmd_main() {
     _parse_name "$session_name"
     session_name="$_PARSED"
     if [[ -n "$session_name" ]] && ! _is_group_name "$session_name"; then
+      if _is_parked "$session_name" && ! _cmd_revive "$session_name"; then
+        sleep 1.5
+        continue
+      fi
       _attach_session "$session_name"
     fi
   done
@@ -1719,7 +2031,11 @@ _cmd_dash() {
     _parse_name "$session_name"
     # A failed switch (session just closed) must not end a long-running dash
     if [[ -n "$_PARSED" ]] && ! _is_group_name "$_PARSED"; then
-      _attach_session "$_PARSED" || true
+      if _is_parked "$_PARSED" && ! _cmd_revive "$_PARSED"; then
+        sleep 1.5
+      else
+        _attach_session "$_PARSED" || true
+      fi
     fi
     [[ $popup -eq 1 ]] && break
   done
@@ -1866,6 +2182,9 @@ ${C_BOLD}Usage:${C_RESET}
   tm attach <name> [-d] Attach to session (-d: detach others)
   tm rename <name>      Rename a session
   tm group <name> <session>...  Put sessions in a group (--clear: back to directory)
+  tm park <name>        Close a session but keep its row; Claude agents resume on revive
+  tm revive <name>      Recreate a parked session with claude --resume
+                        (exit 2: not parked, 1: name taken or nothing to resume)
   tm last               Switch to previous session
   tm ls                 List all sessions (plain text)
   tm ls --json [--state <s>[,<s>]] [--agent <name>] [--session <name>] [--no-summary]
@@ -1898,7 +2217,8 @@ ${C_BOLD}Interactive menu shortcuts:${C_RESET}
   ← / →     Fold / unfold the group (move the cursor while typing a query)
   Ctrl-G    Put selected sessions in a group (empty: back to directory)
   Ctrl-N    Create new session
-  Ctrl-K    Close session (3-stage confirmation)
+  Ctrl-K    Close session (3-stage confirmation); on a parked row: forget it
+  Ctrl-X    Park: close the session, keep the row, Enter resumes its Claude agents
   Ctrl-E    Rename session
   Ctrl-D    Detach other connections
   Ctrl-P    Toggle protection lock
@@ -1913,6 +2233,7 @@ ${C_BOLD}Environment variables:${C_RESET}
                      Default: 48
   TM_SORT            Set to 'recent' to stop floating blocked agents to the top
   TM_GROUPS          Set to 'off' for a flat session list without groups
+  TM_CLAUDE_CMD      Claude command used to revive parked sessions (default: claude)
   TM_STALE_AFTER     Seconds without a hook update before working shows as ⏳?
                      Default: 1800
   TM_NOTIFY_CMD      Command run on agent state transitions; gets the agent JSON on stdin
@@ -3986,6 +4307,7 @@ case "${1:-}" in
   _detach-others)  _cmd_detach_others "${2:-}" ;;
   _fold)           _cmd_fold "${2:-}" "${3:-}" ;;
   _enter)          _cmd_enter "${2:-}" ;;
+  _park)           _check_cmd tmux; _cmd_park "${2:-}" || true ;;
   _group-prompt)   _cmd_group_prompt "$@" ;;
   _create)         _cmd_create ;;
   _summarize)      _cmd_summarize "${2:-}" ;;
@@ -4004,6 +4326,8 @@ case "${1:-}" in
   _dash-reload)    _cmd_dash_reload "${2:-}" ;;
   rename)          _check_cmd tmux; _cmd_rename "${2:-}" ;;
   group)           _check_cmd tmux; _cmd_group "${@:2}" ;;
+  park)            _check_cmd tmux; _cmd_park "${2:-}" ;;
+  revive)          _check_cmd tmux; _cmd_revive "${2:-}" ;;
   last)            _check_cmd tmux; _cmd_last ;;
   templates|tpl)   _cmd_templates ;;
   protect|lock)    _check_cmd tmux; _toggle_protect "${2:-}" ;;

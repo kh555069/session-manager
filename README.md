@@ -145,7 +145,8 @@ Works on desktop and mobile — attach to the same remote tmux sessions from any
 | `Ctrl-G`  | Put selected sessions in a group (empty name: back to directory groups) |
 | `Tab`     | Multi-select (for batch kill with `Ctrl-K`) |
 | `Ctrl-N`  | Create new session                  |
-| `Ctrl-K`  | Kill session (supports multi-select batch kill) |
+| `Ctrl-K`  | Kill session (supports multi-select batch kill); on a parked row: forget it |
+| `Ctrl-X`  | Park: close the session but keep its row; `Enter` on the row resumes its Claude agents |
 | `Ctrl-E`  | Rename session                      |
 | `Ctrl-D`  | Detach other clients                |
 | `Ctrl-P`  | Toggle protection lock 🔒           |
@@ -161,6 +162,14 @@ Works on desktop and mobile — attach to the same remote tmux sessions from any
 - Groups with a blocked agent float to the top like sessions do; inside a group the blocked sessions lead.
 - Manual groups live in `~/.tmux-manager/groups.tsv`, folded groups in `~/.tmux-manager/folded.txt`. Set `TM_GROUPS=off` for the flat list.
 
+#### Parking sessions
+
+- `Ctrl-X` (or `tm park <name>`) closes a session that runs Claude agents but keeps a `⏸ parked` row. It records each agent's conversation ID and directory in `~/.tmux-manager/parked/` (owner-only).
+- `Enter` on the row (or `tm revive <name>`) recreates the session with one window per agent in its directory, each running `claude --resume <id> --dangerously-skip-permissions` (the same flags as `tm restore --claude`; `TM_CLAUDE_CMD` changes the command).
+- Parking asks `y` when every agent is idle; when one is working or waiting, its current turn would be lost, so you type the session name. Protected and current sessions cannot be parked, and a session without a Claude agent is closed with `Ctrl-K` instead.
+- Only Claude panes come back; use `tm save` and `tm restore` to keep a full layout. A live session with the same name hides the parked row, and reviving refuses until the name is free.
+- `Ctrl-K` on a parked row forgets it; the conversations stay in Claude's history. The preview of a parked row shows its agents and their last turn.
+
 ### CLI Mode
 
 ```bash
@@ -172,6 +181,8 @@ tm kill myapp               # Kill session (with safety checks)
 tm attach myapp -d          # Attach and detach other clients
 tm rename myapp             # Rename session
 tm group crawlers a b       # Put sessions in a group (--clear: back to directory)
+tm park myapp               # Close a session, keep its row for a later revive
+tm revive myapp             # Recreate it and resume its Claude conversations
 tm last                     # Switch to the last session
 tm ls                       # List all sessions (plain text)
 tm templates                # List available templates
@@ -461,6 +472,7 @@ Three layers of protection to prevent accidental session termination:
 | `TM_SNAPSHOT_KEEP` | `48`                       | Number of timestamped snapshots kept by `tm save` |
 | `TM_SORT`          | (unset)                    | `recent` stops floating blocked agents to the top |
 | `TM_GROUPS`        | `on`                       | `off` shows a flat session list without groups |
+| `TM_CLAUDE_CMD`    | `claude`                   | Command used to resume agents of a parked session |
 | `TM_STALE_AFTER`   | `1800`                     | Seconds without a hook update before working shows as `⏳?` |
 | `TM_NOTIFY_CMD`    | (unset)                    | Command run on agent state transitions (see Notifications) |
 | `TM_NOTIFY_ON`     | `blocked`                  | States to notify about, comma-separated |

@@ -41,6 +41,8 @@ _tm() {
     'attach:Attach to a session'
     'rename:Rename a session'
     'group:Put sessions in a group'
+    'park:Close a session but keep its row'
+    'revive:Recreate a parked session'
     'ls:List all sessions'
     'wait:Wait for an agent state'
     'dash:Auto-refreshing session overview'
@@ -71,8 +73,13 @@ _tm() {
     kill|rm|remove)
       _tm_sessions && ret=0
       ;;
-    rename)
+    rename|park)
       _tm_sessions && ret=0
+      ;;
+    revive)
+      local -a parked
+      parked=(${${(f)"$(command ls ~/.tmux-manager/parked 2>/dev/null)"}%.json})
+      _describe -t parked 'parked session' parked && ret=0
       ;;
     group)
       # tm group <name>|--clear <session>...
