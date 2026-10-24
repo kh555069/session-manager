@@ -140,7 +140,9 @@ Works on desktop and mobile — attach to the same remote tmux sessions from any
 
 | Shortcut  | Action                              |
 |-----------|-------------------------------------|
-| `Enter`   | Attach to selected session          |
+| `Enter`   | Attach to selected session (on a group row: fold/unfold) |
+| `←` / `→` | Fold / unfold the group (moves the cursor while you type a query) |
+| `Ctrl-G`  | Put selected sessions in a group (empty name: back to directory groups) |
 | `Tab`     | Multi-select (for batch kill with `Ctrl-K`) |
 | `Ctrl-N`  | Create new session                  |
 | `Ctrl-K`  | Kill session (supports multi-select batch kill) |
@@ -150,6 +152,14 @@ Works on desktop and mobile — attach to the same remote tmux sessions from any
 | `Ctrl-R`  | Refresh list                        |
 | `Ctrl-Q`  | Quit                                |
 | `Esc`     | Quit                                |
+
+#### Session groups
+
+- Sessions in the same directory are grouped under a `▾ <dir>:` row; worktrees under `.claude/worktrees/` or `.worktrees/` count as their repo. A directory with a single session is not grouped.
+- `Ctrl-G` or `tm group <name> <session>...` puts sessions in a group of your own, which overrides the directory; a group you name shows even with one session. An empty name (or `tm group --clear`) returns them to their directory group. Renaming a session keeps its group.
+- A group row shows state counts such as `❓1 ⏳2 💤3 (6)`. A folded group (`▸`) also lists its session names, so a query still finds it.
+- Groups with a blocked agent float to the top like sessions do; inside a group the blocked sessions lead.
+- Manual groups live in `~/.tmux-manager/groups.tsv`, folded groups in `~/.tmux-manager/folded.txt`. Set `TM_GROUPS=off` for the flat list.
 
 ### CLI Mode
 
@@ -161,6 +171,7 @@ tm new myapp -t dev         # Create session from template (3 windows)
 tm kill myapp               # Kill session (with safety checks)
 tm attach myapp -d          # Attach and detach other clients
 tm rename myapp             # Rename session
+tm group crawlers a b       # Put sessions in a group (--clear: back to directory)
 tm last                     # Switch to the last session
 tm ls                       # List all sessions (plain text)
 tm templates                # List available templates
@@ -448,6 +459,7 @@ Three layers of protection to prevent accidental session termination:
 | `TM_PROJECT_BASE`  | Two levels above tm.sh     | Directory menu for creating new sessions |
 | `TM_SNAPSHOT_KEEP` | `48`                       | Number of timestamped snapshots kept by `tm save` |
 | `TM_SORT`          | (unset)                    | `recent` stops floating blocked agents to the top |
+| `TM_GROUPS`        | `on`                       | `off` shows a flat session list without groups |
 | `TM_STALE_AFTER`   | `1800`                     | Seconds without a hook update before working shows as `⏳?` |
 | `TM_NOTIFY_CMD`    | (unset)                    | Command run on agent state transitions (see Notifications) |
 | `TM_NOTIFY_ON`     | `blocked`                  | States to notify about, comma-separated |

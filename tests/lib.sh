@@ -16,6 +16,8 @@ setup_env() {
   export TMUX_TMPDIR="$TEST_TMP/tmux"
   export COLUMNS=200
   unset TMUX TMUX_PANE TM_SORT TM_STALE_AFTER
+  # Session groups change the list layout; test_groups.sh turns them on
+  export TM_GROUPS=off
   mkdir -p "$HOME" "$TMUX_TMPDIR" "$TEST_TMP/bin"
   cp "$REPO_ROOT/tm.sh" "$TEST_TMP/bin/tm.sh"
   chmod +x "$TEST_TMP/bin/tm.sh"

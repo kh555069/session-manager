@@ -141,7 +141,9 @@ alias tm="~/session-manager/tm.sh"
 
 | 快捷鍵    | 功能                           |
 |-----------|--------------------------------|
-| `Enter`   | 進入選取的 Session              |
+| `Enter`   | 進入選取的 Session（在群組列上：折疊／展開） |
+| `←` / `→` | 折疊／展開群組（輸入搜尋字串時改為移動游標） |
+| `Ctrl-G`  | 把選取的 session 放進群組（名稱留空：回到依目錄分組） |
 | `Tab`     | 多選（搭配 `Ctrl-K` 批量刪除）  |
 | `Ctrl-N`  | 新建 Session                   |
 | `Ctrl-K`  | 關閉 Session（支援多選批量刪除）|
@@ -151,6 +153,14 @@ alias tm="~/session-manager/tm.sh"
 | `Ctrl-R`  | 重新整理列表                   |
 | `Ctrl-Q`  | 離開                           |
 | `Esc`     | 離開                           |
+
+#### Session 群組
+
+- 同一個目錄的 session 會歸在 `▾ <目錄>:` 群組列底下；`.claude/worktrees/`、`.worktrees/` 底下的 worktree 算在所屬 repo。只有一個 session 的目錄不分組。
+- 用 `Ctrl-G` 或 `tm group <名稱> <session>...` 可以把 session 放進自訂群組，優先於目錄；自訂群組即使只有一個 session 也會顯示。名稱留空（或 `tm group --clear`）就回到依目錄分組。重新命名 session 會保留它的群組。
+- 群組列顯示狀態數量，例如 `❓1 ⏳2 💤3 (6)`。折疊的群組（`▸`）還會列出成員名稱，所以搜尋仍找得到。
+- 有 blocked agent 的群組跟 session 一樣排到最上面；群組內 blocked 的 session 排在前面。
+- 自訂群組存在 `~/.tmux-manager/groups.tsv`，折疊狀態存在 `~/.tmux-manager/folded.txt`。設定 `TM_GROUPS=off` 可改回平面清單。
 
 ### CLI 模式
 
@@ -162,6 +172,7 @@ tm new myapp -t dev         # 用模板建立 session（3 個視窗）
 tm kill myapp               # 關閉 session（有防呆）
 tm attach myapp -d          # 進入 session，踢除其他連線
 tm rename myapp             # 重新命名 session
+tm group crawlers a b       # 把 session 放進群組（--clear：回到依目錄分組）
 tm last                     # 切回上一個 session
 tm ls                       # 純文字列出所有 session
 tm templates                # 列出可用模板
@@ -449,6 +460,7 @@ export TM_NOTIFY_CMD='jq -r "\(.host)/\(.tmux_session) \(.state): \(.message // 
 | `TM_PROJECT_BASE`  | tm.sh 上兩層目錄     | 新建 session 時的目錄選單 |
 | `TM_SNAPSHOT_KEEP` | `48`                 | `tm save` 保留的帶時間戳快照份數 |
 | `TM_SORT`          | （未設定）            | 設為 `recent` 時不把 blocked 排到最上面 |
+| `TM_GROUPS`        | `on`                 | 設為 `off` 時顯示不分組的平面清單 |
 | `TM_STALE_AFTER`   | `1800`               | working 超過幾秒沒有 hook 更新就顯示 `⏳?` |
 | `TM_NOTIFY_CMD`    | （未設定）           | agent 狀態轉換時執行的指令（見推播通知） |
 | `TM_NOTIFY_ON`     | `blocked`            | 要通知的狀態，逗號分隔 |

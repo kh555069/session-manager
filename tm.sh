@@ -38,6 +38,9 @@ printf -v _SELF_Q '%q' "$SELF"
 readonly _SELF_Q
 readonly CONFIG_DIR="${HOME}/.tmux-manager"
 readonly PROTECTED_FILE="${CONFIG_DIR}/protected.txt"
+# Manual session groups (SESSION \t GROUP per line) and folded group labels
+readonly GROUPS_FILE="${CONFIG_DIR}/groups.tsv"
+readonly FOLDED_FILE="${CONFIG_DIR}/folded.txt"
 readonly CLAUDE_SESSION_MAP="${CONFIG_DIR}/claude_sessions.jsonl"
 readonly STATE_DIR="${CONFIG_DIR}/state"
 # Seconds without a hook write before a working agent is shown as "working?"
@@ -76,6 +79,8 @@ readonly IMPORTANT_PROCS="claude|codex|python|node|npm|cargo|go|java|docker|kube
 _CACHED_SESSION_DATA=""
 _CACHED_PROTECTED=""
 _CACHED_AGENT_STATE=""
+_CACHED_GROUPS=""
+_CACHED_FOLDED=""
 _CACHE_LOADED=0
 
 # ─── 2. Init & Dependency Check ───────────────────────
@@ -211,6 +216,10 @@ _build_list_cache() {
   _CACHED_AGENT_STATE=$(tmux list-panes -a \
     -F $'#{session_name}\t#{pane_id}\t#{session_created}\t#{window_index}.#{pane_index}' 2>/dev/null \
     | _agent_states session) || _CACHED_AGENT_STATE=""
+  _CACHED_GROUPS=""
+  [[ -f "$GROUPS_FILE" ]] && _CACHED_GROUPS=$(<"$GROUPS_FILE")
+  _CACHED_FOLDED=""
+  [[ -f "$FOLDED_FILE" ]] && _CACHED_FOLDED=$(<"$FOLDED_FILE")
   _CACHE_LOADED=1
 }
 
@@ -506,12 +515,341 @@ _is_narrow() {
   [[ "$_NARROW" == "1" ]]
 }
 
+# ─── Session groups ───────────────────────────────────
+# Sessions sharing a path (worktrees count as their repo) form a group; a
+# manual group set with `tm group` or Ctrl-G overrides the path. Group rows
+# put "LABEL:" in the NAME column: tmux turns ":" in session names into "_",
+# so a NAME ending in ":" is always a group row, never a session.
+
+_is_group_name() { [[ "$1" == *: ]]; }
+
+_groups_enabled() { [[ "${TM_GROUPS:-on}" != "off" ]]; }
+
+# Manual group of a session from the list cache → $_GROUP (empty: none)
+_manual_group() {
+  local name="$1" s g
+  _GROUP=""
+  while IFS=$'\t' read -r s g; do
+    if [[ -n "$s" && "$s" == "$name" ]]; then
+      _GROUP="$g"
+      return 0
+    fi
+  done <<< "$_CACHED_GROUPS"
+  return 0
+}
+
+# Path group label of a session path → $_GROUP: worktrees folded into their
+# repo, ~ for HOME, ":" replaced so the label cannot end a group row early
+_path_group() {
+  local p="$1"
+  p="${p%%/.claude/worktrees/*}"
+  p="${p%%/.worktrees/*}"
+  [[ "$p" == "$HOME" || "$p" == "$HOME"/* ]] && p="~${p#"$HOME"}"
+  _GROUP="${p//:/_}"
+}
+
+# A group name typed by the user → $_GROUP: ":" and control characters
+# become "_", surrounding spaces go, at most 30 characters
+_sanitize_group() {
+  local g="${1//:/_}"
+  g="${g//[[:cntrl:]]/_}"
+  g="${g#"${g%%[![:space:]]*}"}"
+  g="${g%"${g##*[![:space:]]}"}"
+  _GROUP="${g:0:30}"
+}
+
+# Sessions in recency order (most recently attached first) with their group:
+# arrays _S_NAME _S_ATT _S_WIN _S_PATH _S_ACT _S_STATE _S_GROUP (empty: not
+# in a group). A path group needs two or more sessions; a manual group shows
+# even with one. Returns 1 when there are no sessions.
+_collect_sessions() {
+  local fmt='#{session_name};#{session_attached};#{session_windows};#{session_path};#{session_last_attached};#{session_activity}'
+  local raw
+  raw=$(tmux list-sessions -F "$fmt" 2>/dev/null) || true
+  [[ -n "$raw" ]] || return 1
+  _build_list_cache
+  _S_NAME=(); _S_ATT=(); _S_WIN=(); _S_PATH=(); _S_ACT=(); _S_STATE=(); _S_GROUP=()
+  local -a manual=() auto=()
+  local name attached windows path _last activity i j n=0 count
+  while IFS=';' read -r name attached windows path _last activity; do
+    _S_NAME[n]="$name"; _S_ATT[n]="$attached"; _S_WIN[n]="$windows"
+    _S_PATH[n]="$path"; _S_ACT[n]="$activity"
+    _session_agent_state "$name"
+    _S_STATE[n]="$_AGENT_STATE"
+    manual[n]=""; auto[n]=""
+    if _groups_enabled; then
+      _manual_group "$name"; manual[n]="$_GROUP"
+      _path_group "$path"; auto[n]="$_GROUP"
+    fi
+    n=$((n + 1))
+  done < <(sort -t';' -k5,5 -rn <<< "$raw")
+  for ((i = 0; i < n; i++)); do
+    _S_GROUP[i]="${manual[i]}"
+    [[ -n "${manual[i]}" || -z "${auto[i]}" ]] && continue
+    count=0
+    for ((j = 0; j < n; j++)); do
+      [[ -z "${manual[j]}" && "${auto[j]}" == "${auto[i]}" ]] && count=$((count + 1))
+    done
+    [[ $count -ge 2 ]] && _S_GROUP[i]="${auto[i]}"
+  done
+  return 0
+}
+
+# Whether index I passes PASS (blocked|rest) of the blocked-first ordering
+_in_pass() {
+  [[ "${TM_SORT:-}" == "recent" ]] && return 0
+  if [[ "$1" == "blocked" ]]; then
+    [[ "$2" == "blocked" ]]
+  else
+    [[ "$2" != "blocked" ]]
+  fi
+}
+
+# A group row followed by its sessions unless the group is folded. The row
+# shows state counts and, when folded, the session names, so a query typed
+# in fzf still finds the group of a hidden session.
+_print_group() {
+  local key="$1" i n=${#_S_NAME[@]} blocked=0 working=0 idle=0 total=0
+  local names="" folded=0 pass group_state=rest
+  for ((i = 0; i < n; i++)); do
+    [[ "${_S_GROUP[i]}" == "$key" ]] || continue
+    total=$((total + 1))
+    case "${_S_STATE[i]}" in
+      blocked)           blocked=$((blocked + 1)) ;;
+      working|working\?) working=$((working + 1)) ;;
+      idle)              idle=$((idle + 1)) ;;
+    esac
+    names+="${names:+, }${_S_NAME[i]}"
+  done
+  [[ $'\n'"$_CACHED_FOLDED"$'\n' == *$'\n'"$key"$'\n'* ]] && folded=1
+
+  local arrow="▾" counts=""
+  [[ $folded -eq 1 ]] && arrow="▸"
+  [[ $blocked -gt 0 ]] && counts+="${C_RED}❓${blocked}${C_RESET} "
+  [[ $working -gt 0 ]] && counts+="⏳${working} "
+  [[ $idle -gt 0 ]] && counts+="💤${idle} "
+  counts+="(${total})"
+  [[ $folded -eq 1 ]] && counts+="  ${C_DIM}${names}${C_RESET}"
+  printf "%s\t%-20s\t%s\n" "${C_BOLD}${arrow}${C_RESET}" "${key}:" "$counts"
+  [[ $folded -eq 1 ]] && return 0
+
+  for pass in blocked rest; do
+    [[ "${TM_SORT:-}" == "recent" && "$pass" == "blocked" ]] && continue
+    for ((i = 0; i < n; i++)); do
+      [[ "${_S_GROUP[i]}" == "$key" ]] || continue
+      _in_pass "$pass" "${_S_STATE[i]}" || continue
+      _format_session_line "${_S_NAME[i]}" "${_S_ATT[i]}" "${_S_WIN[i]}" \
+        "${_S_PATH[i]}" "${_S_ACT[i]}" "  "
+    done
+  done
+  return 0
+}
+
+# Group of session NAME → $_GROUP, from arrays set by _collect_sessions
+_group_of() {
+  local i
+  _GROUP=""
+  for ((i = 0; i < ${#_S_NAME[@]}; i++)); do
+    if [[ "${_S_NAME[i]}" == "$1" ]]; then
+      _GROUP="${_S_GROUP[i]}"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# Rewrite a list file atomically. Args: FILE CONTENT
+_write_list_file() {
+  mkdir -p "$CONFIG_DIR"
+  local tmp
+  tmp=$(mktemp "${1}.XXXXXX") || return 1
+  printf '%s' "$2" > "$tmp" && mv "$tmp" "$1"
+}
+
+# Put sessions in GROUP (empty: back to their path group). Args: GROUP NAME...
+_set_groups() {
+  local group="$1" s g n skip out=""
+  shift
+  if [[ -f "$GROUPS_FILE" ]]; then
+    while IFS=$'\t' read -r s g; do
+      [[ -z "$s" ]] && continue
+      skip=0
+      for n in "$@"; do [[ "$s" == "$n" ]] && skip=1; done
+      [[ $skip -eq 0 ]] && out+="${s}"$'\t'"${g}"$'\n'
+    done < "$GROUPS_FILE"
+  fi
+  if [[ -n "$group" ]]; then
+    for n in "$@"; do out+="${n}"$'\t'"${group}"$'\n'; done
+  fi
+  _write_list_file "$GROUPS_FILE" "$out"
+}
+
+# Fold state of group KEY. Args: KEY collapse|expand|toggle
+_set_fold() {
+  local key="$1" action="$2" line out="" found=0 folded=""
+  [[ -f "$FOLDED_FILE" ]] && folded=$(<"$FOLDED_FILE")
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if [[ "$line" == "$key" ]]; then
+      found=1
+      continue
+    fi
+    out+="${line}"$'\n'
+  done <<< "$folded"
+  if [[ "$action" == "collapse" || ( "$action" == "toggle" && $found -eq 0 ) ]]; then
+    out+="${key}"$'\n'
+  fi
+  _write_list_file "$FOLDED_FILE" "$out"
+}
+
+# tm group <name> <session>... | tm group --clear <session>...
+_cmd_group() {
+  local usage="Usage: tm group <name> <session>... | tm group --clear <session>..."
+  [[ $# -ge 2 ]] || { echo "$usage" >&2; exit 3; }
+  local group="$1" s
+  shift
+  if [[ "$group" == "--clear" ]]; then
+    group=""
+  else
+    _sanitize_group "$group"
+    group="$_GROUP"
+    [[ -n "$group" ]] || { echo "$usage" >&2; exit 3; }
+  fi
+  for s in "$@"; do
+    if ! tmux has-session -t "=$s" 2>/dev/null; then
+      printf '%s✗ No such session: %s%s\n' "$C_RED" "$s" "$C_RESET" >&2
+      exit 2
+    fi
+  done
+  _set_groups "$group" "$@"
+  if [[ -n "$group" ]]; then
+    printf '%s✓ %d session(s) → %s%s\n' "$C_GREEN" "$#" "$group" "$C_RESET"
+  else
+    printf '%s✓ %d session(s) back to directory groups%s\n' "$C_GREEN" "$#" "$C_RESET"
+  fi
+}
+
+# Ctrl-G: ask for a group name for the selected sessions (group rows skipped)
+_cmd_group_prompt() {
+  shift  # skip sub-command name passed by self-routing
+  local -a names=()
+  local raw
+  for raw in "$@"; do
+    _parse_name "$raw"
+    [[ -z "$_PARSED" ]] && continue
+    _is_group_name "$_PARSED" && continue
+    names+=("$_PARSED")
+  done
+  if [[ ${#names[@]} -eq 0 ]]; then
+    echo -e "${C_DIM}No session selected${C_RESET}"
+    sleep 0.5
+    return 0
+  fi
+  printf '%sGroup for: %s%s\n' "$C_CYAN" "${names[*]}" "$C_RESET"
+  echo -e "${C_DIM}Empty: back to directory groups · Ctrl-C: cancel${C_RESET}"
+  echo -n "Group > "
+  local group=""
+  read -r group || return 0
+  _sanitize_group "$group"
+  _set_groups "$_GROUP" "${names[@]}"
+  if [[ -n "$_GROUP" ]]; then
+    printf '%s✓ Grouped: %s%s\n' "$C_GREEN" "$_GROUP" "$C_RESET"
+  else
+    echo -e "${C_GREEN}✓ Back to directory groups${C_RESET}"
+  fi
+  sleep 0.5
+}
+
+# Position (1-based) of the row whose NAME is NAME among the rows fzf shows
+# for LIST (header dropped; with a query, `fzf --filter` results); 0 if none.
+# Args: LIST NAME  (env from fzf: FZF_QUERY)
+_list_pos() {
+  local rows line field _skip n=0
+  rows=$(sed 1d <<< "$1")  # without the header line
+  if [[ -n "${FZF_QUERY:-}" ]]; then
+    rows=$("$FZF" --filter="$FZF_QUERY" --exact --delimiter=$'\t' \
+      --with-nth="$(_fzf_with_nth)" <<< "$rows" || true)
+  fi
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    n=$((n + 1))
+    IFS=$'\t' read -r _skip field _skip <<< "$line"
+    _parse_name "$field"
+    if [[ -n "$2" && "$_PARSED" == "$2" ]]; then
+      echo "$n"
+      return 0
+    fi
+  done <<< "$rows"
+  echo 0
+}
+
+# fzf action (transform) for ←/→ and Enter on a group row: fold or unfold the
+# group of ROW (a group row, or a session row for its own group) and reload
+# with the cursor on the group row. With a query typed, ←/→ move the query
+# cursor instead. Args: collapse|expand|toggle ROW_NAME
+_cmd_fold() {
+  local action="$1"
+  if [[ -n "${FZF_QUERY:-}" && "$action" != "toggle" ]]; then
+    if [[ "$action" == "expand" ]]; then echo "forward-char"; else echo "backward-char"; fi
+    return 0
+  fi
+  _parse_name "${2:-}"
+  local name="$_PARSED" key=""
+  if _is_group_name "$name"; then
+    key="${name%:}"
+  else
+    _collect_sessions || return 0
+    _group_of "$name"
+    key="$_GROUP"
+  fi
+  [[ -n "$key" ]] || return 0
+  _set_fold "$key" "$action"
+
+  local run_dir="${CONFIG_DIR}/run" list_file list_q pos
+  mkdir -p "$run_dir" && chmod 700 "$run_dir"
+  list_file=$(mktemp "${run_dir}/fold.XXXXXX")
+  "$SELF" _list > "$list_file"
+  pos=$(_list_pos "$(<"$list_file")" "${key}:")
+  printf -v list_q '%q' "$list_file"
+  if [[ "$pos" -gt 0 ]]; then
+    echo "reload-sync(cat $list_q; rm -f $list_q)+pos($pos)"
+  else
+    echo "reload-sync(cat $list_q; rm -f $list_q)"
+  fi
+}
+
+# fzf action (transform) for Enter: a group row folds or unfolds, a session
+# row is accepted (attached by the caller). Args: ROW_NAME
+_cmd_enter() {
+  _parse_name "${1:-}"
+  if _is_group_name "$_PARSED"; then
+    _cmd_fold toggle "$1"
+  else
+    echo "accept"
+  fi
+}
+
+# Preview of a group row: its sessions with their agent state and idle time
+_group_preview() {
+  local key="$1" i
+  _collect_sessions || { echo "(No tmux sessions)"; return 0; }
+  _NOW=$(date +%s)
+  printf '%s── Group: %s ──────────────────%s\n' "$C_BOLD" "$key" "$C_RESET"
+  for ((i = 0; i < ${#_S_NAME[@]}; i++)); do
+    [[ "${_S_GROUP[i]}" == "$key" ]] || continue
+    _state_icon "${_S_STATE[i]}"
+    printf '  %s %-20s %-5s %s\n' "$_STATE_ICON" "${_S_NAME[i]}" \
+      "$(_relative_time "${_S_ACT[i]}")" "${_S_PATH[i]/#$HOME/~}"
+  done
+  return 0
+}
+
 # ─── 5. Formatted Output for fzf ─────────────────────
 
 _format_session_line() {
   # Output (wide):   STATUS\tNAME[+lock]\tPATH\tWINDOWS\tPANES\tIDLE\tPROCS
   # Output (narrow): STATUS\tNAME[+lock]\tWINDOWS\tPANES\tIDLE\tPROCS
-  local name="$1" attached="$2" windows="$3" path="$4" activity="${5:-0}"
+  local name="$1" attached="$2" windows="$3" path="$4" activity="${5:-0}" indent="${6:-}"
   local panes current status lock="" procs_display="" has_important=0
 
   panes=$(_session_pane_count "$name")
@@ -560,11 +898,11 @@ _format_session_line() {
   if _is_narrow; then
     # Narrow: drop DIRECTORY column, shorten NAME
     printf "%s\t%-16s\t%s\t%s\t%s\t%s\n" \
-      "$status" "${name}${lock}" "$windows" "$panes" "$idle" "${procs_display:--}"
+      "$status" "${indent}${name}${lock}" "$windows" "$panes" "$idle" "${procs_display:--}"
   else
     printf "%s\t%-20s\t%-30s\t%s\t%s\t%s\t%s\n" \
       "$status" \
-      "${name}${lock}" \
+      "${indent}${name}${lock}" \
       "$short_path" \
       "$windows" \
       "$panes" \
@@ -577,11 +915,8 @@ _format_session_line() {
 
 # List all sessions (consumed by fzf)
 _cmd_list() {
-  # Fetch sessions once (also serves as server-alive check, avoids extra _has_tmux_server fork)
-  local fmt='#{session_name};#{session_attached};#{session_windows};#{session_path};#{session_last_attached};#{session_activity}'
-  local sessions_raw
-  sessions_raw=$(tmux list-sessions -F "$fmt" 2>/dev/null) || true
-  if [[ -z "$sessions_raw" ]]; then
+  # Fetching sessions also serves as the server-alive check
+  if ! _collect_sessions; then
     echo "(No tmux sessions)"
     return
   fi
@@ -591,29 +926,31 @@ _cmd_list() {
   else
     printf "ST   \t%-20s\t%-30s\t%s\t%s\t%s\n" "NAME" "DIRECTORY" "W" "P" "IDLE"
   fi
-  # Batch pre-cache to avoid per-session fork overhead
-  _build_list_cache
   _CURRENT_SESSION=$(_current_session)
   _NOW=$(date +%s)
-  # Sort by session_last_attached descending (most recent first).
-  # Unless TM_SORT=recent, sessions with a blocked agent go first (two passes
-  # keep the recency order inside each group).
-  local sorted pass blocked
-  sorted=$(sort -t';' -k5,5 -rn <<< "$sessions_raw")
+  # Items are groups and sessions outside any group, in the order of their
+  # most recently attached session. Unless TM_SORT=recent, items with a
+  # blocked agent go first (two passes keep the recency order in each part).
+  local i j n=${#_S_NAME[@]} pass key state seen=$'\n'
   for pass in blocked rest; do
-    if [[ "${TM_SORT:-}" == "recent" ]]; then
-      [[ "$pass" == "blocked" ]] && continue
-    fi
-    while IFS=';' read -r name attached windows path _last_attached activity; do
-      if [[ "${TM_SORT:-}" != "recent" ]]; then
-        blocked=0
-        _session_agent_state "$name"
-        [[ "$_AGENT_STATE" == "blocked" ]] && blocked=1
-        [[ "$pass" == "blocked" && $blocked -eq 0 ]] && continue
-        [[ "$pass" == "rest" && $blocked -eq 1 ]] && continue
+    [[ "${TM_SORT:-}" == "recent" && "$pass" == "blocked" ]] && continue
+    for ((i = 0; i < n; i++)); do
+      key="${_S_GROUP[i]}"
+      if [[ -z "$key" ]]; then
+        _in_pass "$pass" "${_S_STATE[i]}" || continue
+        _format_session_line "${_S_NAME[i]}" "${_S_ATT[i]}" "${_S_WIN[i]}" \
+          "${_S_PATH[i]}" "${_S_ACT[i]}"
+        continue
       fi
-      _format_session_line "$name" "$attached" "$windows" "$path" "$activity"
-    done <<< "$sorted"
+      [[ "$seen" == *$'\n'"$key"$'\n'* ]] && continue
+      state=rest
+      for ((j = 0; j < n; j++)); do
+        [[ "${_S_GROUP[j]}" == "$key" && "${_S_STATE[j]}" == "blocked" ]] && state=blocked
+      done
+      _in_pass "$pass" "$state" || continue
+      seen+="${key}"$'\n'
+      _print_group "$key"
+    done
   done
 }
 
@@ -622,6 +959,10 @@ _cmd_preview() {
   local raw_name="$1"
   _parse_name "$raw_name"
   local name="$_PARSED"
+  if _is_group_name "$name"; then
+    _group_preview "${name%:}"
+    return
+  fi
 
   # Single tmux call for all session metadata (replaces has-session + 5× display-message)
   local session_info
@@ -973,6 +1314,7 @@ _cmd_rename() {
   local raw_name="$1"
   _parse_name "$raw_name"
   local name="$_PARSED"
+  _is_group_name "$name" && return 0
 
   # Prompt for new name
   echo -e "${C_CYAN}Rename session: ${name}${C_RESET}"
@@ -1008,6 +1350,15 @@ _cmd_rename() {
     echo "$new_name" >> "$PROTECTED_FILE"
   fi
 
+  # Keep a manual group with the session
+  [[ -f "$GROUPS_FILE" ]] && _CACHED_GROUPS=$(<"$GROUPS_FILE")
+  _manual_group "$name"
+  if [[ -n "$_GROUP" ]]; then
+    local group="$_GROUP"
+    _set_groups "" "$name"
+    _set_groups "$group" "$new_name"
+  fi
+
   echo -e "${C_GREEN}✓ Renamed: ${name} → ${new_name}${C_RESET}"
   sleep 0.5
 }
@@ -1017,6 +1368,7 @@ _cmd_toggle_protect() {
   local raw_name="$1"
   _parse_name "$raw_name"
   local name="$_PARSED"
+  _is_group_name "$name" && return 0
   _toggle_protect "$name"
   sleep 0.3
 }
@@ -1034,6 +1386,7 @@ _cmd_kill_selected() {
     _parse_name "$raw_name"
     local name="$_PARSED"
     [[ -z "$name" ]] && continue
+    _is_group_name "$name" && continue
     _cmd_kill "$name"
   done
 }
@@ -1043,6 +1396,7 @@ _cmd_detach_others() {
   local raw_name="$1"
   _parse_name "$raw_name"
   local name="$_PARSED"
+  _is_group_name "$name" && return 0
 
   local count=0
   local my_client=""
@@ -1100,9 +1454,9 @@ _fzf_menu() {
   local fzf_header fzf_with_nth
   fzf_with_nth=$(_fzf_with_nth)
   if _is_narrow; then
-    fzf_header="↵Go Tab^Sel ^NNew ^KKill ^ERen ^DDtch ^PLock ^RRef Esc"
+    fzf_header="↵Go Tab^Sel ←→Fold ^GGrp ^NNew ^KKill ^ERen ^DDtch ^PLock ^RRef Esc"
   else
-    fzf_header="Keys: ↵Enter │ Tab Multi-sel │ ^N New │ ^K Kill │ ^E Rename │ ^D Detach │ ^P Protect │ ^R Refresh │ ^Q Quit"
+    fzf_header="Keys: ↵Enter │ Tab Multi-sel │ ←→ Fold │ ^G Group │ ^N New │ ^K Kill │ ^E Rename │ ^D Detach │ ^P Protect │ ^R Refresh │ ^Q Quit"
   fi
 
   "$SELF" _list \
@@ -1118,6 +1472,10 @@ _fzf_menu() {
         --preview="$_SELF_Q _preview {2}" \
         --preview-window="down:50%:wrap" \
         --bind="tab:toggle+down" \
+        --bind="enter:transform($_SELF_Q _enter {2})" \
+        --bind="right:transform($_SELF_Q _fold expand {2})" \
+        --bind="left:transform($_SELF_Q _fold collapse {2})" \
+        --bind="ctrl-g:execute($_SELF_Q _group-prompt {+2} </dev/tty >/dev/tty)+reload($_SELF_Q _list)" \
         --bind="ctrl-n:execute($_SELF_Q _create </dev/tty >/dev/tty)+reload($_SELF_Q _list)" \
         --bind="ctrl-k:execute($_SELF_Q _kill-selected {+2} </dev/tty >/dev/tty)+reload($_SELF_Q _list)" \
         --bind="ctrl-e:execute($_SELF_Q _rename {2} </dev/tty >/dev/tty)+reload($_SELF_Q _list)" \
@@ -1172,7 +1530,7 @@ _cmd_main() {
     IFS=$'\t' read -r _skip session_name _skip <<< "$first_line"
     _parse_name "$session_name"
     session_name="$_PARSED"
-    if [[ -n "$session_name" ]]; then
+    if [[ -n "$session_name" ]] && ! _is_group_name "$session_name"; then
       _attach_session "$session_name"
     fi
   done
@@ -1228,7 +1586,7 @@ _cmd_dash() {
     IFS=$'\t' read -r _skip session_name _skip <<< "$first_line"
     _parse_name "$session_name"
     # A failed switch (session just closed) must not end a long-running dash
-    if [[ -n "$_PARSED" ]]; then
+    if [[ -n "$_PARSED" ]] && ! _is_group_name "$_PARSED"; then
       _attach_session "$_PARSED" || true
     fi
     [[ $popup -eq 1 ]] && break
@@ -1330,7 +1688,7 @@ _dash_watch() {
 # Args: NAME [DASH_PID]  (env from fzf: FZF_QUERY, FZF_SELECT_COUNT)
 _cmd_dash_reload() {
   _parse_name "${1:-}"
-  local name="$_PARSED" dash_pid="${2:-}" list list_file rows n=0 pos=0 line _skip field
+  local name="$_PARSED" dash_pid="${2:-}" list list_file pos
   [[ "${FZF_SELECT_COUNT:-0}" =~ ^[0-9]+$ && "${FZF_SELECT_COUNT:-0}" -gt 0 ]] && return 0
 
   list=$("$SELF" _list)
@@ -1343,21 +1701,7 @@ _cmd_dash_reload() {
     reload="reload-sync(cat $list_q)"
   fi
 
-  rows=$(sed 1d <<< "$list")  # without the header line
-  if [[ -n "${FZF_QUERY:-}" ]]; then
-    rows=$("$FZF" --filter="$FZF_QUERY" --exact --delimiter=$'\t' \
-      --with-nth="$(_fzf_with_nth)" <<< "$rows" || true)
-  fi
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    n=$((n + 1))
-    IFS=$'\t' read -r _skip field _skip <<< "$line"
-    _parse_name "$field"
-    if [[ -n "$name" && "$_PARSED" == "$name" ]]; then
-      pos=$n
-      break
-    fi
-  done <<< "$rows"
+  pos=$(_list_pos "$list" "$name")
   if [[ $pos -gt 0 ]]; then
     echo "${reload}+pos($pos)"
   else
@@ -1389,6 +1733,7 @@ ${C_BOLD}Usage:${C_RESET}
   tm kill <name>        Close a session (with safeguards)
   tm attach <name> [-d] Attach to session (-d: detach others)
   tm rename <name>      Rename a session
+  tm group <name> <session>...  Put sessions in a group (--clear: back to directory)
   tm last               Switch to previous session
   tm ls                 List all sessions (plain text)
   tm ls --json [--state <s>[,<s>]] [--agent <name>] [--session <name>] [--no-summary]
@@ -1417,7 +1762,9 @@ ${C_BOLD}Usage:${C_RESET}
   tm help               Show this help
 
 ${C_BOLD}Interactive menu shortcuts:${C_RESET}
-  Enter     Attach to selected session
+  Enter     Attach to selected session (on a group row: fold/unfold)
+  ← / →     Fold / unfold the group (move the cursor while typing a query)
+  Ctrl-G    Put selected sessions in a group (empty: back to directory)
   Ctrl-N    Create new session
   Ctrl-K    Close session (3-stage confirmation)
   Ctrl-E    Rename session
@@ -1433,6 +1780,7 @@ ${C_BOLD}Environment variables:${C_RESET}
   TM_SNAPSHOT_KEEP   Number of timestamped snapshots kept by 'tm save'
                      Default: 48
   TM_SORT            Set to 'recent' to stop floating blocked agents to the top
+  TM_GROUPS          Set to 'off' for a flat session list without groups
   TM_STALE_AFTER     Seconds without a hook update before working shows as ⏳?
                      Default: 1800
   TM_NOTIFY_CMD      Command run on agent state transitions; gets the agent JSON on stdin
@@ -3504,6 +3852,9 @@ case "${1:-}" in
   _rename)         _cmd_rename "${2:-}" ;;
   _kill-selected)  _cmd_kill_selected "$@" ;;
   _detach-others)  _cmd_detach_others "${2:-}" ;;
+  _fold)           _cmd_fold "${2:-}" "${3:-}" ;;
+  _enter)          _cmd_enter "${2:-}" ;;
+  _group-prompt)   _cmd_group_prompt "$@" ;;
   _create)         _cmd_create ;;
   _summarize)      _cmd_summarize "${2:-}" ;;
   _record-claude-session) _cmd_record_claude_session ;;
@@ -3520,6 +3871,7 @@ case "${1:-}" in
   _dash-watch)     _dash_watch "${2:-}" "${3:-}" ;;
   _dash-reload)    _cmd_dash_reload "${2:-}" ;;
   rename)          _check_cmd tmux; _cmd_rename "${2:-}" ;;
+  group)           _check_cmd tmux; _cmd_group "${@:2}" ;;
   last)            _check_cmd tmux; _cmd_last ;;
   templates|tpl)   _cmd_templates ;;
   protect|lock)    _check_cmd tmux; _toggle_protect "${2:-}" ;;

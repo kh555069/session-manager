@@ -40,6 +40,7 @@ _tm() {
     'kill:Kill a session'
     'attach:Attach to a session'
     'rename:Rename a session'
+    'group:Put sessions in a group'
     'ls:List all sessions'
     'wait:Wait for an agent state'
     'dash:Auto-refreshing session overview'
@@ -72,6 +73,14 @@ _tm() {
       ;;
     rename)
       _tm_sessions && ret=0
+      ;;
+    group)
+      # tm group <name>|--clear <session>...
+      if (( CURRENT == 3 )); then
+        _message 'group name, or --clear' && ret=0
+      else
+        _tm_sessions && ret=0
+      fi
       ;;
     protect|lock)
       _tm_sessions && ret=0
