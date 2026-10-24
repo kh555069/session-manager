@@ -370,7 +370,8 @@ def transcript_summary(path, tail=262144):
                 if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].strip():
                     summary["reply"] = c["text"]
                 elif c.get("type") == "tool_use":
-                    summary["tools"].append((c.get("id"), str(c.get("name") or "?"),
+                    # Every field reaches the terminal and the tab-separated rows
+                    summary["tools"].append((c.get("id"), cut(c.get("name") or "?", 30),
                                              _tool_arg(c.get("input"))))
     return summary
 

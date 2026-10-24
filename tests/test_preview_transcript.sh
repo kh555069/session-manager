@@ -155,4 +155,16 @@ Shall I merge it into \`main\`?"
   [[ ${#line} -lt 260 ]] || fail "reply not cut: ${#line} chars"
 }
 
+test_tool_name_cannot_inject_escapes_or_columns() {
+  prompt "go"
+  tool_use t1 'Ba\u001b[31msh\tX' '{"command":"ls"}'
+  tool_result t1
+  reply "done"
+  agent idle
+  local raw; raw=$("$TM" _preview a)
+  assert_not_contains "$raw" $'\x1b[31m' no-escape
+  # A tab in the name must not shift the reply into another column
+  assert_contains "$(preview)" "Claude: done" reply-intact
+}
+
 run_tests
