@@ -65,9 +65,12 @@ test_interrupt_since_is_interrupt_time() {
   agent_pane new a
   prompt_entry
   hook_working
-  interrupt_entry "" 2
+  # One timestamp for both the entry and the expectation: computing iso twice
+  # can straddle a second boundary
+  local ts; ts=$(iso 2)
+  printf '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"timestamp":"%s"}\n' "$ts" >> "$(transcript)"
   local since; since=$(agent_field since)
-  assert_eq "$(iso 2 | cut -c1-19)Z" "$since" since
+  assert_eq "${ts:0:19}Z" "$since" since
 }
 
 test_denied_permission_turns_blocked_idle() {
