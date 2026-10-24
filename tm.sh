@@ -285,6 +285,125 @@ def interrupted_at(path, after):
         return ts if ts is not None and ts >= after else None
     return None
 
+_COMMAND = re.compile(r"<command-name>(.*?)</command-name>", re.S)
+_COMMAND_ARGS = re.compile(r"<command-args>(.*?)</command-args>", re.S)
+# Input fields that say what a tool call does, most telling first
+_TOOL_ARG_KEYS = ("command", "file_path", "path", "pattern", "url", "query",
+                  "skill", "description", "prompt")
+
+def cut(value, limit):
+    text = clean(value)
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "\u2026"
+
+def _texts(content):
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        return [c["text"] for c in content if isinstance(c, dict)
+                and c.get("type") == "text" and isinstance(c.get("text"), str)]
+    return []
+
+def _tool_arg(data):
+    if not isinstance(data, dict):
+        return ""
+    for key in _TOOL_ARG_KEYS:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            value = value.strip().splitlines()[0]
+            if key in ("file_path", "path"):
+                value = os.path.basename(value.rstrip("/")) or value
+            return value
+    return ""
+
+def transcript_summary(path, tail=262144):
+    """The last prompt of a Claude transcript with the tools and reply of its turn.
+
+    Returns {"prompt", "tools": [(id, name, arg)], "done": ids with a result,
+    "reply", "interrupted"}, or None without a readable prompt in the last
+    tail bytes. Sidechain and meta entries are skipped; a slash command reads
+    as "/name args"; other text starting with "<" (system wrappers) is no prompt.
+    """
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - tail))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    summary = None
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue  # the first line of the tail may be cut
+        if not isinstance(entry, dict) or entry.get("isSidechain") or entry.get("isMeta"):
+            continue
+        message = entry.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if entry.get("type") == "user":
+            if summary is not None and isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "tool_result":
+                        summary["done"].add(c.get("tool_use_id"))
+            text = "\n".join(_texts(content)).strip()
+            if not text:
+                continue
+            if text.startswith(_INTERRUPT):
+                if summary is not None:
+                    summary["interrupted"] = True
+                continue
+            command = _COMMAND.search(text)
+            if command:
+                args = _COMMAND_ARGS.search(text)
+                text = " ".join(x for x in (command.group(1).strip(),
+                                           args.group(1).strip() if args else "") if x)
+            elif text.startswith("<"):
+                continue
+            summary = {"prompt": text, "tools": [], "done": set(), "reply": "",
+                       "interrupted": False}
+        elif entry.get("type") == "assistant" and summary is not None and isinstance(content, list):
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].strip():
+                    summary["reply"] = c["text"]
+                elif c.get("type") == "tool_use":
+                    summary["tools"].append((c.get("id"), str(c.get("name") or "?"),
+                                             _tool_arg(c.get("input"))))
+    return summary
+
+_MARKDOWN = re.compile(r"^[ \t]*#+[ \t]+|\*\*|`", re.M)
+
+def brief(text, head=120, tail=75):
+    """One line of agent text without markdown marks; a long one keeps its
+    start and its end (often a question to the user) around an ellipsis."""
+    text = clean(_MARKDOWN.sub("", text))
+    if len(text) <= head + tail + 3:
+        return text
+    return text[:head].rstrip() + " \u2026 " + text[-tail:].lstrip()
+
+def summary_fields(path):
+    """PROMPT, TOOLS, REPLY, INTERRUPTED columns for the preview ("-" when empty)."""
+    summary = transcript_summary(path)
+    if summary is None:
+        return ["-", "-", "-", "0"]
+    tools = summary["tools"]
+    parts = []
+    for tool_id, name, arg in tools[-3:]:
+        part = (name + " " + cut(arg, 40)).strip() if arg else name
+        if tool_id not in summary["done"] and not summary["interrupted"]:
+            part += " \u2026"
+        parts.append(part)
+    tools_text = "-"
+    if tools:
+        tools_text = "%d tool%s \u00b7 %s" % (len(tools), "" if len(tools) == 1 else "s",
+                                             " \u00b7 ".join(parts))
+    return [cut(summary["prompt"], 120), tools_text,
+            brief(summary["reply"]) if summary["reply"] else "-",
+            "1" if summary["interrupted"] else "0"]
+
 def load_state(state_dir, pane, created, now, stale_after):
     """Validated state of one pane, or None when its state file is unusable.
 
@@ -329,6 +448,8 @@ def load_state(state_dir, pane, created, now, stale_after):
 # Mode session: SESSION \t AGG_STATE  (blocked > working? > working > idle > unknown)
 # Mode pane:    WIN.PANE \t PANE_ID \t STATE \t SINCE_EPOCH \t REASON \t MESSAGE
 #               (only panes with a valid state file; empty REASON/MESSAGE → "-")
+# Mode preview: pane columns + PROMPT \t TOOLS \t REPLY \t INTERRUPTED (0|1),
+#               a summary of the agent transcript (see summary_fields)
 # Validity rules live in load_state (_PY_STATE_LIB).
 _agent_states() {
   local mode="$1"
@@ -353,10 +474,13 @@ for line in sys.stdin:
     state = "working?" if loaded["stale"] else loaded["state"]
     if rank[state] > rank[agg[session]]:
         agg[session] = state
-    if mode == "pane" and state != "unknown":
+    if mode in ("pane", "preview") and state != "unknown":
         record = loaded["record"]
-        print("\t".join([target, pane, state, str(loaded["since"]),
-                         clean(record.get("reason")), clean(record.get("message"))]))
+        row = [target, pane, state, str(loaded["since"]),
+               clean(record.get("reason")), clean(record.get("message"))]
+        if mode == "preview":
+            row += summary_fields(record.get("transcript_path"))
+        print("\t".join(row))
 
 if mode == "session":
     for session in order:
@@ -1043,12 +1167,14 @@ _cmd_preview() {
   local agent_lines
   agent_lines=$(tmux list-panes -t "$name" -s \
     -F $'#{session_name}\t#{pane_id}\t#{session_created}\t#{window_index}.#{pane_index}' 2>/dev/null \
-    | _agent_states pane) || agent_lines=""
+    | _agent_states preview) || agent_lines=""
   if [[ -n "$agent_lines" ]]; then
     echo ""
     echo -e "${C_BOLD}── Agents ───────────────────────────${C_RESET}"
     local a_target a_pane a_state a_since a_reason a_message a_label
-    while IFS=$'\t' read -r a_target a_pane a_state a_since a_reason a_message; do
+    local a_prompt a_tools a_reply a_interrupted
+    while IFS=$'\t' read -r a_target a_pane a_state a_since a_reason a_message \
+        a_prompt a_tools a_reply a_interrupted; do
       _state_icon "$a_state"
       a_label="$a_state"
       [[ "$a_reason" != "-" ]] && a_label+=" (${a_reason})"
@@ -1061,6 +1187,11 @@ _cmd_preview() {
         # printf, not echo -e: the message is agent text and may contain backslashes
         printf '     %s%s%s\n' "$C_DIM" "$a_message" "$C_RESET"
       fi
+      # What the agent is on, from its transcript (printf: agent text)
+      [[ "$a_prompt" != "-" ]] && printf '     %sYou:%s %s\n' "$C_CYAN" "$C_RESET" "$a_prompt"
+      [[ "$a_tools" != "-" ]] && printf '     %s🔧 %s%s\n' "$C_DIM" "$a_tools" "$C_RESET"
+      [[ "$a_reply" != "-" ]] && printf '     %sClaude:%s %s\n' "$C_GREEN" "$C_RESET" "$a_reply"
+      [[ "$a_interrupted" == "1" ]] && printf '     %s(interrupted)%s\n' "$C_DIM" "$C_RESET"
       if [[ "$a_state" == "blocked" ]]; then
         # Last 15 screen lines show what the agent is asking without attaching;
         # control characters are dropped so pane text cannot drive the terminal

@@ -233,6 +233,7 @@ cp completions/tm.zsh ~/.zsh/completions/_tm
 - 中斷一輪（Esc 或 Ctrl-C，包含在權限畫面拒絕）不會觸發任何 hook，tm 改從 session transcript 判斷中斷，顯示 `💤`。還沒開始輸出就中斷時不留紀錄，會維持 `⏳` 到下一個 prompt。
 - 有 blocked agent 的 session 會排到最上面；設定 `TM_SORT=recent` 可維持單純的最近使用排序。
 - Preview 面板列出每個 agent pane 的狀態、持續多久，blocked 時另外顯示通知訊息。
+- Claude agent 的 preview 另外摘要它的 transcript：最後一個 prompt（`You:`）、這一輪的工具（最近三個，執行中的標 `…`）與最後的回覆（`Claude:`，去掉 markdown 符號；太長時保留開頭與結尾，結尾通常是要問你的問題）。被中斷的一輪顯示 `(interrupted)`。blocked 的 agent 仍會附上畫面最後幾行，因為權限對話框不在 transcript 裡。
 - 狀態依 pane 存放在 `~/.tmux-manager/state/<pane>.json`（僅擁有者可讀）；`tm save` 會清掉已不存在的 pane 的檔案。
 - Hook 在 Claude session 啟動時載入，安裝後需重啟執行中的 Claude session。
 

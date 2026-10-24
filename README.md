@@ -232,6 +232,7 @@ After `tm install-claude-hook`, Claude Code hooks report each agent's state, and
 - Interrupting a turn (Esc or Ctrl-C, including declining a permission prompt) sends no hook, so tm reads the interrupt from the session transcript and shows `💤`. An interrupt before any output leaves no trace and still shows `⏳` until the next prompt.
 - Sessions with a blocked agent float to the top. Set `TM_SORT=recent` to keep the plain most-recent order.
 - The preview panel lists each agent pane with its state, how long it has been in that state, and the notification message when blocked.
+- For a Claude agent the preview also summarizes its transcript: the last prompt (`You:`), the tools of that turn (the last three, `…` while one is running) and the last reply (`Claude:`, markdown marks dropped; a long reply keeps its start and its end, where a question to you usually is). An interrupted turn shows `(interrupted)`. A blocked agent still shows its last screen lines, because the permission dialog is not in the transcript.
 - States are stored per pane in `~/.tmux-manager/state/<pane>.json` (owner-only). `tm save` removes files of panes that no longer exist.
 - Hooks load when a Claude session starts: restart running Claude sessions after installing.
 
